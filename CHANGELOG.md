@@ -14,6 +14,7 @@ and this project adheres to
 - ✨(backend) expose the attachment max size in the config endpoint #2577
 - ✨(frontend) warn before uploading an attachment over the size limit #2577
 - ✨(frontend) add keyboard shortcut to open presentation mode #2697
+- ✨(backend)(frontend) handle DocSpec 4xx/5xx import errors distinctly #2552
 
 ### Fixed
 
@@ -23,6 +24,7 @@ and this project adheres to
 ### Changed
 
 - 💄(frontend) redesign 404 error standalone page #2696
+- 🥅(docspec) handle DocSpec 4xx/5xx import errors distinctly #2712
 
 ## [v5.7.0] - 2026-09-15
 
