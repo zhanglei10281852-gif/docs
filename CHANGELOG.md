@@ -14,6 +14,11 @@ and this project adheres to
 - ✨(backend) expose the attachment max size in the config endpoint #2577
 - ✨(frontend) warn before uploading an attachment over the size limit #2577
 - ✨(frontend) add keyboard shortcut to open presentation mode #2697
+- ✨(frontend) turn pasted doc links into interlinks #2713
+
+### Changed
+
+- 💄(frontend) redesign 404 error standalone page #2696
 
 ### Fixed
 
@@ -21,10 +26,6 @@ and this project adheres to
 
 - 🐛(export) keep image aspect ratio in PDF columns #2670
 - 🐛(frontend) fix redirect after deleting a document #2706
-
-### Changed
-
-- 💄(frontend) redesign 404 error standalone page #2696
 
 ## [v5.7.0] - 2026-09-15
 
