@@ -4,13 +4,18 @@ import { getEmojiAndTitle } from '@/docs/doc-management';
 
 import { DocsExporterODT } from '../types';
 
-export const inlineContentMappingInterlinkingLinkODT: DocsExporterODT['mappings']['inlineContentMapping']['interlinkingLinkInline'] =
+export const createInlineContentMappingInterlinkingLinkODT =
+  (
+    titleMap: Map<string, string>,
+  ): DocsExporterODT['mappings']['inlineContentMapping']['interlinkingLinkInline'] =>
   (inline) => {
-    if (!inline.props.docId || !inline.props.title || inline.props.disabled) {
+    const title = inline.props.docId && titleMap.get(inline.props.docId);
+
+    if (!inline.props.docId || !title || inline.props.disabled) {
       return null;
     }
 
-    const { emoji, titleWithoutEmoji } = getEmojiAndTitle(inline.props.title);
+    const { emoji, titleWithoutEmoji } = getEmojiAndTitle(title);
     const url = window.location.origin + `/docs/${inline.props.docId}/`;
 
     // Create ODT hyperlink using React.createElement to avoid TypeScript JSX namespace issues

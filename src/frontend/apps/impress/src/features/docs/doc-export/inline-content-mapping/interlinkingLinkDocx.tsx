@@ -4,13 +4,18 @@ import { getEmojiAndTitle } from '@/docs/doc-management';
 
 import { DocsExporterDocx } from '../types';
 
-export const inlineContentMappingInterlinkingLinkDocx: DocsExporterDocx['mappings']['inlineContentMapping']['interlinkingLinkInline'] =
+export const createInlineContentMappingInterlinkingLinkDocx =
+  (
+    titleMap: Map<string, string>,
+  ): DocsExporterDocx['mappings']['inlineContentMapping']['interlinkingLinkInline'] =>
   (inline) => {
-    if (!inline.props.docId || !inline.props.title || inline.props.disabled) {
+    const title = inline.props.docId && titleMap.get(inline.props.docId);
+
+    if (!inline.props.docId || !title || inline.props.disabled) {
       return new TextRun('');
     }
 
-    const { emoji, titleWithoutEmoji } = getEmojiAndTitle(inline.props.title);
+    const { emoji, titleWithoutEmoji } = getEmojiAndTitle(title);
 
     return new ExternalHyperlink({
       children: [
