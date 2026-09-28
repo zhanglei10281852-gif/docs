@@ -3,6 +3,7 @@ Test AI services in the impress core app.
 """
 # pylint: disable=protected-access
 
+import asyncio
 import json
 import warnings
 from collections.abc import AsyncIterator
@@ -24,7 +25,10 @@ from core.services.ai_services.blocknote import (
     BLOCKNOTE_TOOL_STRICT_PROMPT,
     AIService,
     configure_pydantic_model_provider,
-    convert_async_generator_to_sync,
+)
+from core.services.ai_services.streaming import (
+    cancelable_async_stream,
+    cancelable_sync_stream,
 )
 from core.services.ai_services.legacy import (
     LegacyAiServiceMistralClient,
@@ -252,39 +256,39 @@ def test_services_ai_translate_unknown_language(mock_create):
     assert "xx-unknown" in system_content
 
 
-# -- convert_async_generator_to_sync --
+# -- cancelable_sync_stream --
 
 
-def test_convert_async_generator_to_sync_basic():
+def test_cancelable_sync_stream_basic():
     """Should convert an async generator yielding items to a sync iterator."""
 
     async def async_gen():
         for item in ["hello", "world", "!"]:
             yield item
 
-    result = list(convert_async_generator_to_sync(async_gen()))
+    result = list(cancelable_sync_stream(async_gen()))
     assert result == ["hello", "world", "!"]
 
 
-def test_convert_async_generator_to_sync_empty():
+def test_cancelable_sync_stream_empty():
     """Should handle an empty async generator."""
 
     async def async_gen():
         return
         yield
 
-    result = list(convert_async_generator_to_sync(async_gen()))
+    result = list(cancelable_sync_stream(async_gen()))
     assert not result
 
 
-def test_convert_async_generator_to_sync_exception():
+def test_cancelable_sync_stream_exception():
     """Should propagate exceptions from the async generator."""
 
     async def async_gen():
         yield "first"
         raise ValueError("async error")
 
-    sync_iter = convert_async_generator_to_sync(async_gen())
+    sync_iter = cancelable_sync_stream(async_gen())
     assert next(sync_iter) == "first"
 
     with pytest.raises(ValueError, match="async error"):
@@ -515,7 +519,8 @@ def test_services_ai_stream_sync_mode(mock_build, monkeypatch):
 
 @patch.object(AIService, "_build_async_stream")
 def test_services_ai_stream_async_mode(mock_build, monkeypatch):
-    """In async mode, stream() should return the async iterator directly."""
+    """In async mode, stream() should return a cancelable async iterator
+    forwarding the upstream chunks."""
 
     async def mock_async_gen():
         yield "chunk1"
@@ -529,7 +534,14 @@ def test_services_ai_stream_async_mode(mock_build, monkeypatch):
     request = MagicMock()
     result = service.stream(request)
 
-    assert result is mock_async_iter
+    # The upstream iterator is wrapped for cancellation propagation.
+    assert result is not mock_async_iter
+    assert isinstance(result, AsyncIterator)
+
+    async def collect():
+        return [chunk async for chunk in result]
+
+    assert asyncio.run(collect()) == ["chunk1", "chunk2"]
     mock_build.assert_called_once_with(request)
 
 

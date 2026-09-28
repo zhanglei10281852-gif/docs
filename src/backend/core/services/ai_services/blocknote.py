@@ -1,11 +1,8 @@
 """AI services."""
 
-import asyncio
 import json
 import logging
 import os
-import queue
-import threading
 from collections.abc import AsyncIterator, Iterator
 from functools import cache
 from typing import Any, Dict, Union
@@ -26,6 +23,11 @@ from pydantic_ai.ui import SSE_CONTENT_TYPE
 from pydantic_ai.ui.vercel_ai import VercelAIAdapter
 from pydantic_ai.ui.vercel_ai.request_types import TextUIPart, UIMessage
 from rest_framework.request import Request
+
+from core.services.ai_services.streaming import (
+    cancelable_async_stream,
+    cancelable_sync_stream,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,40 +61,6 @@ IDs ALWAYS end with "$". Use ids EXACTLY as provided.
 
 Return ONLY the JSON tool input. No prose, no markdown.
 """
-
-
-def convert_async_generator_to_sync(async_gen: AsyncIterator[str]) -> Iterator[str]:
-    """Convert an async generator to a sync generator."""
-    q: queue.Queue[str | object] = queue.Queue()
-    sentinel = object()
-    exc_sentinel = object()
-
-    async def run_async_gen():
-        try:
-            async for async_item in async_gen:
-                q.put(async_item)
-        except Exception as exc:  # pylint: disable=broad-except #noqa: BLE001
-            q.put((exc_sentinel, exc))
-        finally:
-            q.put(sentinel)
-
-    def start_async_loop():
-        asyncio.run(run_async_gen())
-
-    thread = threading.Thread(target=start_async_loop, daemon=True)
-    thread.start()
-
-    try:
-        while True:
-            item = q.get()
-            if item is sentinel:
-                break
-            if isinstance(item, tuple) and item[0] is exc_sentinel:
-                # re-raise the exception in the sync context
-                raise item[1]
-            yield item
-    finally:
-        thread.join()
 
 
 @cache
@@ -306,10 +274,15 @@ class AIService:
 
         Returns an async iterator when running in async mode (ASGI)
         or a sync iterator when running in sync mode (WSGI).
+
+        In both modes the returned iterator is cancellation-aware: closing
+        it / disconnecting the client propagates all the way up to the
+        upstream AI stream instead of leaving a model connection and a
+        worker thread busy in the background.
         """
         async_stream = self._build_async_stream(request)
 
         if os.environ.get("PYTHON_SERVER_MODE", "sync") == "async":
-            return async_stream
+            return cancelable_async_stream(async_stream)
 
-        return convert_async_generator_to_sync(async_stream)
+        return cancelable_sync_stream(async_stream, request.META)

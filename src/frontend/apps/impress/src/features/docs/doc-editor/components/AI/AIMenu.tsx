@@ -280,6 +280,17 @@ export const AIMenu = (props: AIMenuProps) => {
     };
   }, [ai]);
 
+  useEffect(() => {
+    return () => {
+      // Safety net: if the menu is closed (or the editor is torn down on
+      // document switch / navigation) while a generation is still running,
+      // the in-flight request must actually stop. abort() is a no-op when
+      // no request is in the "thinking"/"ai-writing" state, and an active
+      // cancellation must not be surfaced as a failure.
+      void ai.abort();
+    };
+  }, [ai]);
+
   return (
     <Box className="--docs--ai-menu" $width="100%" $maxWidth="500px">
       <AIMenuStyle />

@@ -1,0 +1,1252 @@
+﻿diff --git a/src/backend/core/services/ai_services/blocknote.py b/src/backend/core/services/ai_services/blocknote.py
+index 3bcfc147..198088ee 100644
+--- a/src/backend/core/services/ai_services/blocknote.py
++++ b/src/backend/core/services/ai_services/blocknote.py
+@@ -1,11 +1,8 @@
+ """AI services."""
+ 
+-import asyncio
+ import json
+ import logging
+ import os
+-import queue
+-import threading
+ from collections.abc import AsyncIterator, Iterator
+ from functools import cache
+ from typing import Any, Dict, Union
+@@ -27,6 +24,11 @@ from pydantic_ai.ui.vercel_ai import VercelAIAdapter
+ from pydantic_ai.ui.vercel_ai.request_types import TextUIPart, UIMessage
+ from rest_framework.request import Request
+ 
++from core.services.ai_services.streaming import (
++    cancelable_async_stream,
++    cancelable_sync_stream,
++)
++
+ log = logging.getLogger(__name__)
+ 
+ BLOCKNOTE_TOOL_STRICT_PROMPT = """
+@@ -61,40 +63,6 @@ Return ONLY the JSON tool input. No prose, no markdown.
+ """
+ 
+ 
+-def convert_async_generator_to_sync(async_gen: AsyncIterator[str]) -> Iterator[str]:
+-    """Convert an async generator to a sync generator."""
+-    q: queue.Queue[str | object] = queue.Queue()
+-    sentinel = object()
+-    exc_sentinel = object()
+-
+-    async def run_async_gen():
+-        try:
+-            async for async_item in async_gen:
+-                q.put(async_item)
+-        except Exception as exc:  # pylint: disable=broad-except #noqa: BLE001
+-            q.put((exc_sentinel, exc))
+-        finally:
+-            q.put(sentinel)
+-
+-    def start_async_loop():
+-        asyncio.run(run_async_gen())
+-
+-    thread = threading.Thread(target=start_async_loop, daemon=True)
+-    thread.start()
+-
+-    try:
+-        while True:
+-            item = q.get()
+-            if item is sentinel:
+-                break
+-            if isinstance(item, tuple) and item[0] is exc_sentinel:
+-                # re-raise the exception in the sync context
+-                raise item[1]
+-            yield item
+-    finally:
+-        thread.join()
+-
+-
+ @cache
+ def configure_pydantic_model_provider() -> OpenAIChatModel | MistralModel:
+     """Configure a pydantic Model and return it."""
+@@ -306,10 +274,15 @@ class AIService:
+ 
+         Returns an async iterator when running in async mode (ASGI)
+         or a sync iterator when running in sync mode (WSGI).
++
++        In both modes the returned iterator is cancellation-aware: closing
++        it / disconnecting the client propagates all the way up to the
++        upstream AI stream instead of leaving a model connection and a
++        worker thread busy in the background.
+         """
+         async_stream = self._build_async_stream(request)
+ 
+         if os.environ.get("PYTHON_SERVER_MODE", "sync") == "async":
+-            return async_stream
++            return cancelable_async_stream(async_stream)
+ 
+-        return convert_async_generator_to_sync(async_stream)
++        return cancelable_sync_stream(async_stream, request.META)
+diff --git a/src/backend/core/services/ai_services/streaming.py b/src/backend/core/services/ai_services/streaming.py
+new file mode 100644
+index 00000000..90c11ab8
+--- /dev/null
++++ b/src/backend/core/services/ai_services/streaming.py
+@@ -0,0 +1,323 @@
++"""Cancellation-aware bridges between the upstream async AI stream and the
++``StreamingHttpResponse`` consumed by Django.
++
++Two runtimes are supported:
++
++* ASGI (``PYTHON_SERVER_MODE=async``): Django cancels the streaming task on
++  ``http.disconnect``. :func:`cancelable_async_stream` makes sure the
++  cancellation reaches the upstream model connection.
++* WSGI (``PYTHON_SERVER_MODE=sync``): :func:`cancelable_sync_stream` runs the
++  async upstream in a dedicated thread (with its own event loop) and forwards
++  chunks through a bounded queue. Client disconnects are detected when the
++  WSGI server closes the iterator (a write failed) and, on gunicorn, by
++  polling the raw client socket so an idle "thinking" stream is interrupted
++  too.
++
++In both modes the cleanup is idempotent (resources are released exactly
++once), chunks or errors arriving after the cancellation are discarded
++instead of being raised, while genuine upstream errors keep propagating with
++their original semantics.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import logging
++import queue
++import select
++import socket
++import ssl
++import threading
++from collections.abc import AsyncIterator, Callable, Iterator, Mapping
++from typing import Any
++
++log = logging.getLogger(__name__)
++
++#: Wake-up interval of a WSGI worker blocked while waiting for the next
++#: upstream chunk. Every wake-up is an opportunity to notice that the client
++#: went away, even while the model is still "thinking".
++DISCONNECT_POLL_INTERVAL = 0.5
++#: Bounded wait for the upstream-consuming thread on release. The thread is
++#: daemonized, so an upstream that ignores cancellation can never pin a
++#: WSGI worker longer than this.
++WORKER_JOIN_TIMEOUT = 5.0
++#: Maximum number of chunks buffered between the (possibly fast) upstream
++#: and the (network-bound) HTTP client. Provides backpressure without ever
++#: blocking the producer event loop (see ``_SyncStreamBridge._enqueue``).
++QUEUE_MAX_SIZE = 64
++_QUEUE_PUT_TIMEOUT = 0.1
++
++_END = object()
++_ERROR = object()
++
++
++async def safe_aclose(async_iterable: AsyncIterator[Any]) -> None:
++    """Close an async iterator, swallowing secondary cleanup errors.
++
++    Closing an already exhausted or finalized async generator is a no-op.
++    ``CancelledError`` / ``GeneratorExit`` are intentionally not swallowed:
++    an active cancellation must keep propagating.
++    """
++    aclose = getattr(async_iterable, "aclose", None)
++    if aclose is None:
++        return
++    with contextlib.suppress(Exception):
++        await aclose()
++
++
++async def cancelable_async_stream(
++    async_iterable: AsyncIterator[str],
++) -> AsyncIterator[str]:
++    """Forward chunks from ``async_iterable`` to an ASGI response.
++
++    ``async for`` does not close its iterator, so the upstream model stream
++    is closed explicitly on every exit path: normal completion, genuine
++    error propagation and client disconnection (Django cancels the streaming
++    task on ``http.disconnect``, which unwinds this generator). Anything the
++    upstream emits afterwards is discarded; an active cancellation never
++    surfaces as an error.
++    """
++    try:
++        async for chunk in async_iterable:
++            yield chunk
++    finally:
++        await safe_aclose(async_iterable)
++
++
++def build_disconnect_checker(
++    meta: Mapping[str, Any] | None,
++) -> Callable[[], bool] | None:
++    """Build a zero-argument callable reporting client disconnections.
++
++    Only gunicorn exposes the live client socket in the WSGI environ
++    (``gunicorn.socket``). When the running server doesn't expose it
++    (e.g. the Django development server), ``None`` is returned: the
++    disconnect is then detected on the next write, when the WSGI server
++    closes the response iterator.
++    """
++    if not isinstance(meta, Mapping):
++        return None
++
++    client_socket = meta.get("gunicorn.socket")
++    if client_socket is None:
++        return None
++
++    def client_disconnected() -> bool:
++        try:
++            readable, _, _ = select.select([client_socket], [], [], 0)
++        except OSError, ValueError:
++            return True
++        if not readable:
++            return False
++        try:
++            # The request body has already been fully consumed when the
++            # response is streamed, so readable data here can only be a
++            # FIN (empty read) or a RST (OSError) from the client.
++            return client_socket.recv(1, socket.MSG_PEEK) == b""
++        except ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError:
++            return False
++        except OSError:
++            return True
++
++    return client_disconnected
++
++
++class _ConsumerGoneError(Exception):
++    """Internal signal: the producer noticed the cancellation while blocked
++    on a full queue."""
++
++
++class _SyncStreamBridge:  # pylint: disable=too-many-instance-attributes
++    """Run an async iterator in a dedicated thread and expose it as a
++    cancellation-aware sync iterator consumed by a WSGI worker.
++
++    Two threads collaborate:
++
++    * the **WSGI worker thread** iterates the bridge and blocks on a bounded
++      ``queue.get`` poll loop, periodically checking the client socket;
++    * the **producer thread** runs a private event loop, pulls the upstream
++      chunks and pushes them to the bounded queue.
++
++    All termination paths (natural end, upstream error, iterator close after
++    a failed write, client socket closed while idle) collapse into a single
++    idempotent :meth:`release`.
++    """
++
++    def __init__(
++        self,
++        async_iterable: AsyncIterator[str],
++        is_client_disconnected: Callable[[], bool] | None,
++    ) -> None:
++        self._agen = async_iterable
++        self._is_client_disconnected = is_client_disconnected
++        self._queue: queue.Queue[Any] = queue.Queue(maxsize=QUEUE_MAX_SIZE)
++        self._cancel = threading.Event()
++        self._released = threading.Event()
++        self._release_lock = threading.Lock()
++        self._loop_ready = threading.Event()
++        self._loop: asyncio.AbstractEventLoop | None = None
++        self._thread = threading.Thread(
++            target=self._run_event_loop,
++            name="ai-upstream-stream",
++            daemon=True,
++        )
++
++    # -- consumer side (WSGI worker thread) -------------------------------
++
++    def __iter__(self) -> Iterator[str]:
++        return self._iterate()
++
++    def _iterate(self) -> Iterator[str]:
++        # Lazy start: building the bridge must not consume any upstream data
++        # before the response is actually iterated.
++        self._thread.start()
++        try:
++            while True:
++                try:
++                    item = self._queue.get(timeout=DISCONNECT_POLL_INTERVAL)
++                except queue.Empty:
++                    if self._cancel.is_set():
++                        return
++                    if (
++                        self._is_client_disconnected is not None
++                        and self._is_client_disconnected()
++                    ):
++                        return
++                    continue
++
++                # Discard anything arriving after the cancellation, late
++                # errors included.
++                if self._cancel.is_set():
++                    return
++                if item is _END:
++                    return
++                if isinstance(item, tuple) and item[0] is _ERROR:
++                    raise item[1]
++                yield item
++        finally:
++            self.release()
++
++    def release(self) -> None:
++        """Release every resource exactly once.
++
++        Safe to call repeatedly and from any termination path.
++        """
++        if self._released.is_set():
++            return
++        with self._release_lock:
++            if self._released.is_set():
++                return
++            self._released.set()
++
++        # Unblocks the producer's cancellation watcher, which in turn
++        # cancels the upstream chunk awaited on the producer loop.
++        self._cancel.set()
++
++        self._loop_ready.wait(timeout=1.0)
++        self._thread.join(timeout=WORKER_JOIN_TIMEOUT)
++        if self._thread.is_alive():
++            log.warning(
++                "AI upstream stream did not stop within %.0fs after "
++                "cancellation; leaving the daemon thread to finish",
++                WORKER_JOIN_TIMEOUT,
++            )
++
++    # -- producer side (dedicated thread + private event loop) ------------
++
++    def _run_event_loop(self) -> None:
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        self._loop = loop
++        self._loop_ready.set()
++        try:
++            loop.run_until_complete(self._produce())
++        except Exception:  # pylint: disable=broad-except; never escape the thread
++            # pragma: no cover - _produce swallows its own errors
++            log.exception("AI upstream stream thread crashed")
++        finally:
++            loop.close()
++
++    async def _wait_for_cancel(self) -> None:
++        # Block an executor thread, not the event loop, while waiting so the
++        # loop stays free to cancel the in-flight upstream await.
++        while not self._cancel.is_set():
++            await asyncio.to_thread(self._cancel.wait, 0.05)
++
++    async def _enqueue(self, chunk: str) -> None:
++        while not self._cancel.is_set():
++            try:
++                await asyncio.to_thread(
++                    self._queue.put, chunk, True, _QUEUE_PUT_TIMEOUT
++                )
++            except queue.Full:
++                continue
++            return
++        raise _ConsumerGoneError
++
++    async def _produce(self) -> None:
++        try:
++            while True:
++                if self._cancel.is_set():
++                    break
++
++                # Race the next upstream chunk against the cancellation.
++                chunk_task = asyncio.ensure_future(anext(self._agen))
++                cancel_task = asyncio.ensure_future(self._wait_for_cancel())
++                done, _ = await asyncio.wait(
++                    {chunk_task, cancel_task},
++                    return_when=asyncio.FIRST_COMPLETED,
++                )
++
++                if cancel_task in done:
++                    # Cancellation wins even if a chunk or an upstream error
++                    # lands at the very same moment: cancel the pending
++                    # anext (this throws into the upstream generator and
++                    # closes the model HTTP connection) and drop the result.
++                    chunk_task.cancel()
++                    with contextlib.suppress(asyncio.CancelledError, Exception):
++                        await chunk_task
++                    await safe_aclose(self._agen)
++                    return
++
++                cancel_task.cancel()
++                with contextlib.suppress(asyncio.CancelledError):
++                    await cancel_task
++
++                try:
++                    chunk = chunk_task.result()
++                except StopAsyncIteration:
++                    break
++
++                if self._cancel.is_set():
++                    break
++                try:
++                    await self._enqueue(chunk)
++                except _ConsumerGoneError:
++                    break
++                if self._cancel.is_set():
++                    break
++        except Exception as exc:  # pylint: disable=broad-except #noqa: BLE001
++            # Genuine upstream failure: preserve its original semantics, but
++            # never resurrect it once the consumer is gone.
++            if not self._cancel.is_set():
++                with contextlib.suppress(queue.Full):
++                    self._queue.put((_ERROR, exc), timeout=_QUEUE_PUT_TIMEOUT)
++        finally:
++            # NOTE: ``_cancel`` must stay clear on a natural / errored end,
++            # otherwise the consumer would mistake a forwarded error (or the
++            # last chunks) for a cancellation and drop them.
++            await safe_aclose(self._agen)
++            # The consumer is already gone if the queue is full; nobody is
++            # waiting for the sentinel then.
++            with contextlib.suppress(queue.Full):
++                self._queue.put(_END, timeout=_QUEUE_PUT_TIMEOUT)
++
++
++def cancelable_sync_stream(
++    async_iterable: AsyncIterator[str],
++    meta: Mapping[str, Any] | None = None,
++) -> Iterator[str]:
++    """Expose an async AI stream as a sync iterator for WSGI, with client
++    disconnects and generator closes propagated up to the upstream."""
++    return iter(_SyncStreamBridge(async_iterable, build_disconnect_checker(meta)))
+diff --git a/src/backend/core/tests/test_services_ai_services.py b/src/backend/core/tests/test_services_ai_services.py
+index bed1a485..39b5570c 100644
+--- a/src/backend/core/tests/test_services_ai_services.py
++++ b/src/backend/core/tests/test_services_ai_services.py
+@@ -3,6 +3,7 @@ Test AI services in the impress core app.
+ """
+ # pylint: disable=protected-access
+ 
++import asyncio
+ import json
+ import warnings
+ from collections.abc import AsyncIterator
+@@ -24,7 +25,10 @@ from core.services.ai_services.blocknote import (
+     BLOCKNOTE_TOOL_STRICT_PROMPT,
+     AIService,
+     configure_pydantic_model_provider,
+-    convert_async_generator_to_sync,
++)
++from core.services.ai_services.streaming import (
++    cancelable_async_stream,
++    cancelable_sync_stream,
+ )
+ from core.services.ai_services.legacy import (
+     LegacyAiServiceMistralClient,
+@@ -252,39 +256,39 @@ def test_services_ai_translate_unknown_language(mock_create):
+     assert "xx-unknown" in system_content
+ 
+ 
+-# -- convert_async_generator_to_sync --
++# -- cancelable_sync_stream --
+ 
+ 
+-def test_convert_async_generator_to_sync_basic():
++def test_cancelable_sync_stream_basic():
+     """Should convert an async generator yielding items to a sync iterator."""
+ 
+     async def async_gen():
+         for item in ["hello", "world", "!"]:
+             yield item
+ 
+-    result = list(convert_async_generator_to_sync(async_gen()))
++    result = list(cancelable_sync_stream(async_gen()))
+     assert result == ["hello", "world", "!"]
+ 
+ 
+-def test_convert_async_generator_to_sync_empty():
++def test_cancelable_sync_stream_empty():
+     """Should handle an empty async generator."""
+ 
+     async def async_gen():
+         return
+         yield
+ 
+-    result = list(convert_async_generator_to_sync(async_gen()))
++    result = list(cancelable_sync_stream(async_gen()))
+     assert not result
+ 
+ 
+-def test_convert_async_generator_to_sync_exception():
++def test_cancelable_sync_stream_exception():
+     """Should propagate exceptions from the async generator."""
+ 
+     async def async_gen():
+         yield "first"
+         raise ValueError("async error")
+ 
+-    sync_iter = convert_async_generator_to_sync(async_gen())
++    sync_iter = cancelable_sync_stream(async_gen())
+     assert next(sync_iter) == "first"
+ 
+     with pytest.raises(ValueError, match="async error"):
+@@ -515,7 +519,8 @@ def test_services_ai_stream_sync_mode(mock_build, monkeypatch):
+ 
+ @patch.object(AIService, "_build_async_stream")
+ def test_services_ai_stream_async_mode(mock_build, monkeypatch):
+-    """In async mode, stream() should return the async iterator directly."""
++    """In async mode, stream() should return a cancelable async iterator
++    forwarding the upstream chunks."""
+ 
+     async def mock_async_gen():
+         yield "chunk1"
+@@ -529,7 +534,14 @@ def test_services_ai_stream_async_mode(mock_build, monkeypatch):
+     request = MagicMock()
+     result = service.stream(request)
+ 
+-    assert result is mock_async_iter
++    # The upstream iterator is wrapped for cancellation propagation.
++    assert result is not mock_async_iter
++    assert isinstance(result, AsyncIterator)
++
++    async def collect():
++        return [chunk async for chunk in result]
++
++    assert asyncio.run(collect()) == ["chunk1", "chunk2"]
+     mock_build.assert_called_once_with(request)
+ 
+ 
+diff --git a/src/backend/core/tests/test_services_ai_streaming.py b/src/backend/core/tests/test_services_ai_streaming.py
+new file mode 100644
+index 00000000..0b6c0b7a
+--- /dev/null
++++ b/src/backend/core/tests/test_services_ai_streaming.py
+@@ -0,0 +1,442 @@
++# pylint: disable=protected-access
++"""Tests for the cancellation-aware AI stream bridges.
++
++These tests cover the contract that matters for the "Stop" feature:
++
++* a client disconnect / iterator close propagates to the upstream AI stream
++  promptly, both in WSGI (sync bridge, dedicated thread + event loop) and in
++  ASGI (async wrapper, task cancellation);
++* chunks and errors arriving after the cancellation are discarded;
++* genuine upstream errors keep their original semantics;
++* resources are released exactly once and a subsequent stream is not
++  affected by leftover threads, queues or event loops.
++"""
++
++import asyncio
++import contextlib
++import socket
++import ssl
++import threading
++
++import pytest
++
++from core.services.ai_services import streaming
++from core.services.ai_services.streaming import (
++    _END,
++    _ERROR,
++    _SyncStreamBridge,
++    build_disconnect_checker,
++    cancelable_async_stream,
++    cancelable_sync_stream,
++)
++
++# Tests must not wait the production poll interval (0.5s).
++FAST_POLL_INTERVAL = 0.01
++
++
++@pytest.fixture(autouse=True)
++def fast_poll(monkeypatch):
++    """Speed up the disconnect poll loop in the sync bridge."""
++    monkeypatch.setattr(streaming, "DISCONNECT_POLL_INTERVAL", FAST_POLL_INTERVAL)
++    monkeypatch.setattr(streaming, "WORKER_JOIN_TIMEOUT", 5.0)
++
++
++@pytest.fixture
++def fake_select_always_readable(monkeypatch):
++    """Make ``select`` report the given sockets as immediately readable."""
++
++    def fake_select(read, _write, _error, _timeout):
++        return list(read), [], []
++
++    monkeypatch.setattr(streaming.select, "select", fake_select)
++
++
++class FakeSocket:
++    """Minimal stand-in for the ``gunicorn.socket`` environ entry."""
++
++    def __init__(self, recv_result):
++        self._recv_result = recv_result
++
++    def fileno(self):
++        return 1
++
++    def recv(self, _size, _flags=0):
++        result = self._recv_result
++        if isinstance(result, BaseException):
++            raise result
++        return result
++
++
++def _stream_threads_alive():
++    return [
++        thread
++        for thread in threading.enumerate()
++        if thread.name == "ai-upstream-stream" and thread.is_alive()
++    ]
++
++
++# -- build_disconnect_checker ----------------------------------------------
++
++
++def test_disconnect_checker_unavailable_without_socket():
++    """No checker is built when the server doesn't expose the client socket."""
++    assert build_disconnect_checker(None) is None
++    assert build_disconnect_checker({}) is None
++    assert build_disconnect_checker({"other.key": object()}) is None
++
++
++@pytest.mark.usefixtures("fake_select_always_readable")
++def test_disconnect_checker_detects_fin():
++    """An empty peek read is the client closing the connection (FIN)."""
++    checker = build_disconnect_checker({"gunicorn.socket": FakeSocket(b"")})
++    assert checker is not None
++    assert checker() is True
++
++
++@pytest.mark.usefixtures("fake_select_always_readable")
++def test_disconnect_checker_detects_rst():
++    """An OSError while peeking is a reset/dead connection."""
++    checker = build_disconnect_checker(
++        {"gunicorn.socket": FakeSocket(ConnectionResetError())}
++    )
++    assert checker is not None
++    assert checker() is True
++
++
++@pytest.mark.usefixtures("fake_select_always_readable")
++def test_disconnect_checker_ssl_want_read_is_alive():
++    """TLS renegotiation-like transient states must not look like a close."""
++    checker = build_disconnect_checker(
++        {"gunicorn.socket": FakeSocket(ssl.SSLWantReadError())}
++    )
++    assert checker is not None
++    assert checker() is False
++
++
++def test_disconnect_checker_no_data_is_alive(monkeypatch):
++    """When select reports nothing readable, the client is still connected."""
++    monkeypatch.setattr(streaming.select, "select", lambda _r, _w, _e, _t: ([], [], []))
++    checker = build_disconnect_checker({"gunicorn.socket": FakeSocket(b"")})
++    assert checker is not None
++    assert checker() is False
++
++
++# -- cancelable_sync_stream (WSGI) -----------------------------------------
++
++
++def test_sync_stream_forwards_chunks():
++    async def upstream():
++        for item in ["a", "b", "c"]:
++            yield item
++
++    assert list(cancelable_sync_stream(upstream(), {})) == ["a", "b", "c"]
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_empty():
++    async def upstream():
++        return
++        yield
++
++    assert list(cancelable_sync_stream(upstream(), {})) == []
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_propagates_upstream_error():
++    async def upstream():
++        yield "first"
++        raise ValueError("boom")
++
++    sync_iter = iter(cancelable_sync_stream(upstream(), {}))
++    assert next(sync_iter) == "first"
++    with pytest.raises(ValueError, match="boom"):
++        next(sync_iter)
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_close_after_chunk_stops_upstream():
++    """Closing the iterator after a failed write must cancel a stream that
++    is still waiting for the next chunk (e.g. while the model thinks)."""
++    upstream_closed = threading.Event()
++    first_chunk_consumed = threading.Event()
++
++    async def upstream():
++        try:
++            yield "chunk1"
++            first_chunk_consumed.set()
++            await asyncio.sleep(30)
++            yield "late"
++        finally:
++            upstream_closed.set()
++
++    sync_iter = iter(cancelable_sync_stream(upstream(), {}))
++    assert next(sync_iter) == "chunk1"
++    assert first_chunk_consumed.wait(5)
++
++    # Simulates the WSGI server closing the response iterator when writing
++    # the next chunk fails because the client went away.
++    sync_iter.close()
++
++    assert upstream_closed.wait(5), "upstream AI stream was not closed"
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_idle_client_disconnect_is_detected(
++    fake_select_always_readable,
++):
++    """A closed client socket must interrupt an idle stream without waiting
++    for the next upstream chunk."""
++    upstream_closed = threading.Event()
++
++    async def upstream():
++        try:
++            await asyncio.sleep(30)
++            yield "late"
++        finally:
++            upstream_closed.set()
++
++    meta = {"gunicorn.socket": FakeSocket(b"")}
++    sync_iter = iter(
++        cancelable_sync_stream(upstream(), meta),
++    )
++
++    assert list(sync_iter) == []
++    assert upstream_closed.wait(5), "idle stream kept running after disconnect"
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_late_chunks_discarded_with_fast_producer():
++    """A fast upstream must not pin the worker: bounded queue + cancellation
++    must stop the producer even if it keeps generating after the close."""
++    upstream_closed = threading.Event()
++
++    async def upstream():
++        try:
++            index = 0
++            while True:
++                yield f"chunk-{index}"
++                index += 1
++                await asyncio.sleep(0)
++        finally:
++            upstream_closed.set()
++
++    sync_iter = iter(cancelable_sync_stream(upstream(), {}))
++    assert next(sync_iter) == "chunk-0"
++
++    # Let the producer fill the bounded queue (it then blocks on enqueue).
++    assert _stream_threads_alive() != []
++    sync_iter.close()
++
++    assert upstream_closed.wait(5), "fast producer was not stopped"
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_late_error_dropped_after_cancellation():
++    """An error reaching the queue once the consumer is gone must not be
++    resurrected; cancellation wins the race."""
++
++    async def upstream():
++        yield "chunk1"
++
++    bridge = _SyncStreamBridge(upstream(), None)
++    sync_iter = iter(bridge)
++    assert next(sync_iter) == "chunk1"
++
++    bridge.release()
++    # A late upstream error (or a late chunk / sentinel) is enqueued while
++    # or right after the release: the consumer must simply stop.
++    bridge._queue.put((_ERROR, RuntimeError("late boom")))
++    bridge._queue.put("late chunk")
++    bridge._queue.put(_END)
++    assert list(sync_iter) == []
++
++    # Idempotent release: safe to call again (resources released once).
++    bridge.release()
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_release_idempotent_on_natural_end():
++    async def upstream():
++        yield "only"
++
++    bridge = _SyncStreamBridge(upstream(), None)
++    assert list(iter(bridge)) == ["only"]
++    bridge.release()
++    bridge.release()
++    assert _stream_threads_alive() == []
++
++
++def test_sync_stream_worker_thread_is_daemon():
++    """The background thread must never hold the process hostage."""
++
++    async def upstream():
++        yield "x"
++
++    bridge = _SyncStreamBridge(upstream(), None)
++    sync_iter = iter(bridge)
++    assert next(sync_iter) == "x"
++    assert bridge._thread.daemon is True
++    list(sync_iter)
++
++
++def test_sync_stream_followup_stream_unaffected(fake_select_always_readable):
++    """A generation started after a cancellation must work independently,
++    with no residual thread / queue / loop state leaking into it."""
++
++    async def slow_then_late():
++        try:
++            await asyncio.sleep(30)
++            yield "late"
++        finally:
++            pass
++
++    # First generation: client goes away while the model is still thinking.
++    canceled = iter(
++        cancelable_sync_stream(slow_then_late(), {"gunicorn.socket": FakeSocket(b"")})
++    )
++    assert list(canceled) == []
++    assert _stream_threads_alive() == []
++
++    # A brand new generation right after must behave normally.
++    async def upstream():
++        yield "fresh1"
++        yield "fresh2"
++
++    assert list(cancelable_sync_stream(upstream(), {})) == ["fresh1", "fresh2"]
++    assert _stream_threads_alive() == []
++
++
++# -- cancelable_async_stream (ASGI) ----------------------------------------
++
++
++def test_async_stream_forwards_chunks_and_closes_upstream():
++    upstream_closed = threading.Event()
++
++    async def upstream():
++        try:
++            for item in ["a", "b"]:
++                yield item
++        finally:
++            upstream_closed.set()
++
++    async def scenario():
++        wrapped = cancelable_async_stream(upstream())
++        assert await wrapped.__anext__() == "a"
++        assert await wrapped.__anext__() == "b"
++        with pytest.raises(StopAsyncIteration):
++            await wrapped.__anext__()
++
++    asyncio.run(scenario())
++    assert upstream_closed.is_set()
++
++
++def test_async_stream_task_cancellation_stops_idle_upstream():
++    """Django cancels the streaming task on http.disconnect; the upstream
++    model connection must be closed by the wrapper."""
++    upstream_closed = threading.Event()
++
++    async def upstream():
++        try:
++            await asyncio.sleep(30)
++            yield "never"
++        finally:
++            upstream_closed.set()
++
++    async def scenario():
++        wrapped = cancelable_async_stream(upstream())
++
++        async def consume():
++            return await wrapped.__anext__()
++
++        task = asyncio.ensure_future(consume())
++        await asyncio.sleep(0.05)
++        task.cancel()
++        with contextlib.suppress(BaseException):
++            await task
++        # Give the finalizers a chance to schedule on the loop.
++        await asyncio.sleep(0.05)
++
++    asyncio.run(scenario())
++    assert upstream_closed.wait(2), "upstream stream survived task cancellation"
++
++
++def test_async_stream_task_cancellation_between_chunks():
++    """Cancellation while the wrapper is suspended waiting for the next
++    chunk must close the upstream even after some chunks were delivered."""
++    upstream_closed = threading.Event()
++
++    async def upstream():
++        try:
++            yield "first"
++            await asyncio.sleep(30)
++            yield "second"
++        finally:
++            upstream_closed.set()
++
++    async def scenario():
++        wrapped = cancelable_async_stream(upstream())
++        received = []
++
++        async def consume():
++            async for chunk in wrapped:
++                received.append(chunk)
++
++        task = asyncio.ensure_future(consume())
++        await asyncio.sleep(0.05)
++        task.cancel()
++        with contextlib.suppress(BaseException):
++            await task
++        await asyncio.sleep(0.05)
++        return received
++
++    received = asyncio.run(scenario())
++    assert received == ["first"]
++    assert upstream_closed.wait(2)
++
++
++def test_async_stream_propagates_upstream_error():
++    """Real upstream errors keep their original semantics."""
++
++    async def upstream():
++        yield "ok"
++        raise ValueError("real failure")
++
++    async def scenario():
++        wrapped = cancelable_async_stream(upstream())
++        assert await wrapped.__anext__() == "ok"
++        with pytest.raises(ValueError, match="real failure"):
++            await wrapped.__anext__()
++
++    asyncio.run(scenario())
++
++
++def test_async_stream_explicit_aclose_after_consumption():
++    """aclosing() (as Django uses it) after partial consumption closes the
++    upstream generator."""
++    upstream_closed = threading.Event()
++
++    async def upstream():
++        try:
++            yield "a"
++            yield "b"
++        finally:
++            upstream_closed.set()
++
++    async def scenario():
++        wrapped = cancelable_async_stream(upstream())
++        assert await wrapped.__anext__() == "a"
++        await wrapped.aclose()
++        # Subsequent iterations must not resurrect the stream.
++        with pytest.raises(StopAsyncIteration):
++            await wrapped.__anext__()
++
++    asyncio.run(scenario())
++    assert upstream_closed.is_set()
++
++
++# -- misc ------------------------------------------------------------------
++
++
++def test_msg_peek_constant_available():
++    """The disconnect checker relies on MSG_PEEK; guard platform support."""
++    assert hasattr(socket, "MSG_PEEK")
+diff --git a/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/AIMenu.tsx b/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/AIMenu.tsx
+index 5f42a59e..1d1e3523 100644
+--- a/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/AIMenu.tsx
++++ b/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/AIMenu.tsx
+@@ -280,6 +280,17 @@ export const AIMenu = (props: AIMenuProps) => {
+     };
+   }, [ai]);
+ 
++  useEffect(() => {
++    return () => {
++      // Safety net: if the menu is closed (or the editor is torn down on
++      // document switch / navigation) while a generation is still running,
++      // the in-flight request must actually stop. abort() is a no-op when
++      // no request is in the "thinking"/"ai-writing" state, and an active
++      // cancellation must not be surfaced as a failure.
++      void ai.abort();
++    };
++  }, [ai]);
++
+   return (
+     <Box className="--docs--ai-menu" $width="100%" $maxWidth="500px">
+       <AIMenuStyle />
+diff --git a/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/__tests__/useAI.test.tsx b/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/__tests__/useAI.test.tsx
+new file mode 100644
+index 00000000..d15c2d35
+--- /dev/null
++++ b/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/__tests__/useAI.test.tsx
+@@ -0,0 +1,186 @@
++﻿﻿import { renderHook, waitFor } from '@testing-library/react';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const mocks = vi.hoisted(() => ({
++  fetchAPI: vi.fn((_url: string, _init?: RequestInit): Promise<Response> =>
++    Promise.resolve(new Response()),
++  ),
++  aiExtension: vi.fn((options: unknown) => options),
++  chatTransport: vi.fn((options: unknown) => options),
++}));
++
++vi.mock('@/api', () => ({
++  fetchAPI: mocks.fetchAPI,
++}));
++
++vi.mock('@/core', () => ({
++  useConfig: () => ({ data: { AI_BOT: 'test-bot' } }),
++}));
++
++vi.mock('@/docs/doc-management', () => ({}));
++
++vi.mock('@blocknote/xl-ai', () => ({
++  AIExtension: mocks.aiExtension,
++}));
++
++vi.mock('ai', () => ({
++  DefaultChatTransport: class {
++    public constructor(options: unknown) {
++      mocks.chatTransport(options);
++      Object.assign(this, options);
++    }
++  },
++}));
++
++import { useAI } from '../useAI';
++
++const signalOfCall = (index: number): AbortSignal => {
++  const init = mocks.fetchAPI.mock.calls[index]?.[1];
++  if (!init?.signal) {
++    throw new Error(`expected an abort signal for fetchAPI call ${index}`);
++  }
++  return init.signal;
++};
++
++describe('useAI', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    mocks.fetchAPI.mockResolvedValue(new Response());
++  });
++
++  it('returns null when AI is not allowed', () => {
++    const { result } = renderHook(() => useAI('doc-1', false));
++    expect(result.current).toBeNull();
++  });
++
++  it('configures a transport whose custom fetch calls the AI proxy', async () => {
++    const { result } = renderHook(() => useAI('doc-1', true));
++
++    const extension = result.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++    const upstream = new AbortController();
++
++    await extension.transport.fetch('http://upstream', {
++      signal: upstream.signal,
++    });
++
++    expect(mocks.fetchAPI).toHaveBeenCalledWith(
++      'documents/doc-1/ai-proxy/',
++      expect.objectContaining({ signal: expect.any(AbortSignal) }),
++    );
++  });
++
++  it('aborts the request when the AI SDK signal aborts (Stop button)', async () => {
++    const { result } = renderHook(() => useAI('doc-1', true));
++    const extension = result.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++
++    const upstream = new AbortController();
++    const promise = extension.transport.fetch('http://upstream', {
++      signal: upstream.signal,
++    });
++
++    const chainedSignal = signalOfCall(0);
++    expect(chainedSignal.aborted).toBe(false);
++
++    upstream.abort('stopped by user');
++    expect(chainedSignal.aborted).toBe(true);
++    expect(chainedSignal.reason).toBe('stopped by user');
++
++    await promise;
++  });
++
++  it('aborts in-flight requests on unmount (document switch / navigation)', () => {
++    const { result, unmount } = renderHook(() => useAI('doc-1', true));
++    const extension = result.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++
++    const first = new AbortController();
++    const second = new AbortController();
++    void extension.transport.fetch('http://upstream', { signal: first.signal });
++    void extension.transport.fetch('http://upstream', {
++      signal: second.signal,
++    });
++
++    const firstSignal = signalOfCall(0);
++    const secondSignal = signalOfCall(1);
++
++    unmount();
++
++    expect(firstSignal.aborted).toBe(true);
++    expect(secondSignal.aborted).toBe(true);
++  });
++
++  it('does not fail when unmounting after requests completed', async () => {
++    const { result, unmount } = renderHook(() => useAI('doc-1', true));
++    const extension = result.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++
++    await extension.transport.fetch('http://upstream');
++
++    await waitFor(() => {
++      const signal = signalOfCall(0);
++      expect(signal.aborted).toBe(false);
++    });
++
++    expect(() => unmount()).not.toThrow();
++  });
++
++  it('starts already aborted when the upstream signal is aborted beforehand', () => {
++    const { result } = renderHook(() => useAI('doc-1', true));
++    const extension = result.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++
++    const upstream = new AbortController();
++    upstream.abort('already stopped');
++    void extension.transport.fetch('http://upstream', {
++      signal: upstream.signal,
++    });
++
++    const chainedSignal = signalOfCall(0);
++    expect(chainedSignal.aborted).toBe(true);
++    expect(chainedSignal.reason).toBe('already stopped');
++  });
++
++  it('does not share cancellation state across document instances', () => {
++    const { result: first, unmount: unmountFirst } = renderHook(() =>
++      useAI('doc-1', true),
++    );
++    const firstExtension = first.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++    void firstExtension.transport.fetch('http://upstream');
++    const firstSignal = signalOfCall(0);
++
++    const { result: second } = renderHook(() => useAI('doc-2', true));
++    const secondExtension = second.current as unknown as {
++      transport: {
++        fetch: (input: string, init?: RequestInit) => Promise<Response>;
++      };
++    };
++    void secondExtension.transport.fetch('http://upstream');
++    const secondSignal = signalOfCall(1);
++
++    unmountFirst();
++
++    expect(firstSignal.aborted).toBe(true);
++    expect(secondSignal.aborted).toBe(false);
++  });
++});
+diff --git a/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/useAI.tsx b/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/useAI.tsx
+index 607b3d65..13cd0290 100644
+--- a/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/useAI.tsx
++++ b/src/frontend/apps/impress/src/features/docs/doc-editor/components/AI/useAI.tsx
+@@ -1,6 +1,6 @@
+ import { AIExtension } from '@blocknote/xl-ai';
+ import { DefaultChatTransport } from 'ai';
+-import { useMemo } from 'react';
++import { useEffect, useMemo, useRef } from 'react';
+ 
+ import { fetchAPI } from '@/api';
+ import { useConfig } from '@/core';
+@@ -9,6 +9,26 @@ import { Doc } from '@/docs/doc-management';
+ export const useAI = (docId: Doc['id'], aiAllowed: boolean) => {
+   const conf = useConfig().data;
+ 
++  // Tracks the AI streams in flight for this editor. Switching document
++  // (the editor unmounts while the new collaboration provider loads) or
++  // leaving the page aborts the very same HTTP requests, so the backend
++  // stops pulling the upstream model stream instead of keeping the
++  // generation running in the background with the UI hidden.
++  const activeStreamsRef = useRef(new Set<AbortController>());
++
++  useEffect(() => {
++    const activeStreams = activeStreamsRef.current;
++
++    return () => {
++      activeStreams.forEach((controller) => {
++        controller.abort(
++          new DOMException('AI generation stopped', 'AbortError'),
++        );
++      });
++      activeStreams.clear();
++    };
++  }, [docId]);
++
+   return useMemo(() => {
+     if (!aiAllowed) {
+       return null;
+@@ -21,10 +41,36 @@ export const useAI = (docId: Doc['id'], aiAllowed: boolean) => {
+           const headers = new Headers(init?.headers);
+           headers.delete('Authorization');
+ 
++          // The AI SDK aborts its own `init.signal` when chat.stop() is
++          // called (the "Stop" button / Escape). Chain it with a controller
++          // owned by this hook: either signal aborts the single fetch below,
++          // and editor teardown aborts it too even if the extension itself
++          // never invokes abort().
++          const controller = new AbortController();
++          const untrack = () => {
++            activeStreamsRef.current.delete(controller);
++          };
++          activeStreamsRef.current.add(controller);
++          controller.signal.addEventListener('abort', untrack, { once: true });
++
++          const upstreamSignal = init?.signal;
++          if (upstreamSignal) {
++            if (upstreamSignal.aborted) {
++              controller.abort(upstreamSignal.reason);
++            } else {
++              upstreamSignal.addEventListener(
++                'abort',
++                () => controller.abort(upstreamSignal.reason),
++                { once: true },
++              );
++            }
++          }
++
+           return fetchAPI(`documents/${docId}/ai-proxy/`, {
+             ...init,
+             headers,
+-          });
++            signal: controller.signal,
++          }).finally(untrack);
+         },
+       }),
+       agentCursor: conf?.AI_BOT,

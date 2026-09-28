@@ -1,0 +1,23 @@
+2026-09-28 交付复盘验证
+基线：a75dbaaeb9ed4190be4f8dbf2d39bb65a5858cb7
+Session：573311172224344:a425f081ac5f5dd66535bc4081bfd2eb_6ab9f29410f1e67928489181.6ab9f29410f1e67928489184.6ab9f29410f1e67928489182:TraeCode CN.3.3.93.no_sid.no_ppe.T(2026/9/28 12:52:36)
+有效轮数证据：count-trae-cn-steps.py；scope=latest_turn；rounds=132；effectiveRounds=132。
+时长证据：trae-session-realtime-duration；2026-09-28T04:52:36.740Z 至 2026-09-28T06:49:49.018Z；7032 秒；严格不足 7200 秒，结论“否”。
+
+通过验证：
+- python -m pytest -p no:cacheprovider -q core/tests/test_services_ai_streaming.py => 21 passed
+- python -m pytest -p no:cacheprovider -q core/tests/test_services_ai_services.py => 35 passed
+- python -m pytest -p no:cacheprovider -p review_docs_fs_plugin -q core/tests/documents/test_api_documents_ai_proxy.py => 27 passed
+- yarn workspace app-impress vitest run src/features/docs/doc-editor/components/AI/__tests__/useAI.test.tsx => 7 passed
+- yarn workspace app-impress tsc --noEmit => exit 0
+
+失败验证：
+- python -m ruff check changed-python-files => exit 1；test_services_ai_services.py:6 I001 Import block is un-sorted or un-formatted
+- yarn workspace app-impress eslint changed-frontend-files => exit 1；useAI.test.tsx:1:1 no-irregular-whitespace
+- prettier --check changed-frontend-files => exit 1；useAI.test.tsx code style issues
+
+对抗验证原始结果：
+cleanup_failure: caller_observed_error=false, chunks=[chunk], close_calls=1
+asgi_consumer_close: first=chunk, caller_observed_error=false, close_calls=1
+wsgi_cancel_close_count: first=first, close_calls=2
+stubborn_provider: first=first, release_seconds=0.054, bridge_thread_alive_after_release=true, bridge_thread_alive_after_unblock=false, upstream_closed_after_unblock=true
