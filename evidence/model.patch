@@ -1,4 +1,4 @@
-﻿diff --git a/src/backend/core/services/ai_services/blocknote.py b/src/backend/core/services/ai_services/blocknote.py
+diff --git a/src/backend/core/services/ai_services/blocknote.py b/src/backend/core/services/ai_services/blocknote.py
 index 3bcfc147..198088ee 100644
 --- a/src/backend/core/services/ai_services/blocknote.py
 +++ b/src/backend/core/services/ai_services/blocknote.py

@@ -10,11 +10,11 @@ Session：573311172224344:a425f081ac5f5dd66535bc4081bfd2eb_6ab9f29410f1e67928489
 - python -m pytest -p no:cacheprovider -p review_docs_fs_plugin -q core/tests/documents/test_api_documents_ai_proxy.py => 27 passed
 - yarn workspace app-impress vitest run src/features/docs/doc-editor/components/AI/__tests__/useAI.test.tsx => 7 passed
 - yarn workspace app-impress tsc --noEmit => exit 0
+- yarn eslint changed-frontend-files => exit 0
 
 失败验证：
 - python -m ruff check changed-python-files => exit 1；test_services_ai_services.py:6 I001 Import block is un-sorted or un-formatted
-- yarn workspace app-impress eslint changed-frontend-files => exit 1；useAI.test.tsx:1:1 no-irregular-whitespace
-- prettier --check changed-frontend-files => exit 1；useAI.test.tsx code style issues
+- prettier --check changed-frontend-files => exit 1；useAI.test.tsx code style issues；文件起始字节为 EF BB BF EF BB BF（双 BOM）
 
 对抗验证原始结果：
 cleanup_failure: caller_observed_error=false, chunks=[chunk], close_calls=1
