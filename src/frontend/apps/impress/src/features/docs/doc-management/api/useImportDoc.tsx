@@ -15,6 +15,7 @@ import {
 import { useToast } from '@/hooks';
 
 import { Doc } from '../types';
+import { getImportDocumentId } from '../utils/importId';
 
 import { DocsResponse, KEY_LIST_DOC } from './useDocs';
 
@@ -42,9 +43,10 @@ export const ContentTypes: {
   },
 };
 
-export const importDoc = async ([file, mimeType]: [
+export const importDoc = async ([file, mimeType, parentId]: [
   File,
   string,
+  string?,
 ]): Promise<Doc> => {
   const form = new FormData();
 
@@ -56,7 +58,13 @@ export const importDoc = async ([file, mimeType]: [
     }),
   );
 
-  const response = await fetchAPI(`documents/`, {
+  // Replayable identity: retries of the same file into the same parent reuse
+  // it and the server returns the originally created document instead of
+  // creating a duplicate.
+  form.append('id', await getImportDocumentId(file, parentId));
+
+  const endpoint = parentId ? `documents/${parentId}/children/` : 'documents/';
+  const response = await fetchAPI(endpoint, {
     method: 'POST',
     body: form,
     withoutContentType: true,
@@ -69,14 +77,16 @@ export const importDoc = async ([file, mimeType]: [
   return response.json() as Promise<Doc>;
 };
 
-type UseImportDocOptions = UseMutationOptions<Doc, APIError, [File, string]>;
+type ImportDocVariables = [File, string, string?];
+
+type UseImportDocOptions = UseMutationOptions<Doc, APIError, ImportDocVariables>;
 
 export function useImportDoc(props?: UseImportDocOptions) {
   const { toast } = useToast();
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
-  return useMutation<Doc, APIError, [File, string]>({
+  return useMutation<Doc, APIError, ImportDocVariables>({
     mutationFn: importDoc,
     ...props,
     onSuccess: (...successProps) => {
@@ -97,6 +107,15 @@ export function useImportDoc(props?: UseImportDocOptions) {
           },
           (oldData) => {
             if (!oldData || oldData?.pages.length === 0) {
+              return oldData;
+            }
+
+            // A retried import replays the same document: insert it only once
+            // so the list keeps its current size on duplicate responses.
+            const alreadyListed = oldData.pages.some((page) =>
+              page.results.some((doc) => doc.id === importedDoc.id),
+            );
+            if (alreadyListed) {
               return oldData;
             }
 

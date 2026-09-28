@@ -1,0 +1,1551 @@
+diff --git a/.trae/documents/import_idempotency_plan.md b/.trae/documents/import_idempotency_plan.md
+new file mode 100644
+index 00000000..db72bda6
+--- /dev/null
++++ b/.trae/documents/import_idempotency_plan.md
+@@ -0,0 +1,108 @@
++# DOCX/Markdown 导入幂等化 实现计划
++
++## 一、仓库调研结论
++
++### 后端（Django + DRF + PostgreSQL + S3/MinIO）
++
++两个创建入口，均接受 `file` 多部分上传（DOCX/MD → 外部转换服务 → YJS base64）：
++
++1. **根文档入口**：`POST /api/v1.0/documents/`
++   - `DocumentViewSet` 使用 `CreateModelMixin.create` → `perform_create()`（[viewsets.py#L737-L757](file:///f:/swe/092211/project-03/src/backend/core/api/viewsets.py#L737-L757)）
++   - `_apply_uploaded_file_conversion()` 先执行昂贵的外部 HTTP 转换（[viewsets.py#L697-L735](file:///f:/swe/092211/project-03/src/backend/core/api/viewsets.py#L697-L735)），随后 `Document.add_root()`（`Document.save` 会先写 DB 再把内容写 S3），最后**独立地** `DocumentAccess.objects.create(OWNER)`。
++   - 整个过程**没有事务包裹**：add_root 与 owner 关系之间崩溃会产生"没有所有者的半成品"。
++
++2. **子文档入口**：`POST /api/v1.0/documents/{id}/children/`（[viewsets.py#L1089-L1127](file:///f:/swe/092211/project-03/src/backend/core/api/viewsets.py#L1089-L1127)）
++   - 同样先转换，再 `document.add_child()`；**不创建 DocumentAccess**（子文档通过树路径继承权限，测试明确断言 `child.accesses.exists() is False`）。
++
++3. **已有的可利用基础**：
++   - `DocumentSerializer.validate_id` 已允许客户端在 POST 时强制指定 UUID（接受 v1/3/4/5），但文档已存在时一律 400（[serializers.py#L237-L264](file:///f:/swe/092211/project-03/src/backend/core/api/serializers.py#L237-L264)）。
++   - 文档内容以 `{document_id}/file` 为 key 存于 S3（[models.py#L1053-L1065](file:///f:/swe/092211/project-03/src/backend/core/models.py#L1053-L1065)），因此**身份 = 文档 UUID** 时 S3 key 也是确定性的，崩溃重试会覆盖同一孤儿对象。
++   - 路径碰撞已有 `create_tree_node_with_retry()`（内部为 savepoint 原子块，[treebeard.py](file:///f:/swe/092211/project-03/src/backend/core/utils/treebeard.py)）。
++   - PostgreSQL 支持会话级 advisory lock，可在不持有长事务的情况下串行化同一身份的并发请求，连接断开时锁自动释放。
++   - 最新迁移为 `0033`。
++
++4. **前端（Next.js + React Query）**：
++   - 根导入：[useImportDoc.tsx](file:///f:/swe/092211/project-03/src/frontend/apps/impress/src/features/docs/doc-management/api/useImportDoc.tsx) 用 FormData POST `documents/`，成功后把文档**直接前插**到两个列表缓存首页（不过滤重复 id），并弹成功 toast。
++   - 拖拽/选择：[useImport.tsx](file:///f:/swe/092211/project-03/src/frontend/apps/impress/src/features/docs/doc-management/hooks/useImport.tsx)；当前文件导入 UI 仅在根级（文档内隐藏），但 API 层将支持 `parentId` 以服务子文档入口。
++   - 已依赖 `uuid@14`（含 `v5`）；`crypto.subtle.digest` 可用于文件 SHA-256。
++   - `fetchAPI` 支持自定义 headers，但 multipart 下追加表单字段最直接。
++
++### 设计决策
++
++- **可重放身份 = 客户端为"每次文件导入"确定性生成的文档 UUID（v5）**，随 `id` 表单字段提交（根与子文档同一机制）。派生输入：`SHA-256(文件字节) + 文件名 + 目标父级（根为空串）`。同一文件重试（断网/超时后重新选择同一文件、快速双击）身份自动相同；不同文件/父级身份不同。
++- **服务端新增 `DocumentImport` 身份记录表**（身份、用户、父级、文件名、文件哈希、content_type、状态 PROCESSING/COMPLETED、文档 FK）。指纹行在转换前**独立短事务先行提交**：转换失败/创建回滚后记录仍在，同文件可安全重试，不同文件凭记录判定 409。
++- **并发**：PostgreSQL 会话级 advisory lock（由 UUID 派生 64bit key）。并发同身份请求：一个执行，另一个阻塞等待后重放；持锁者崩溃 → 连接关闭自动放锁 → 后来者接管恢复。
++- **崩溃恢复（从确定状态继续）**：转换产物在 DB 创建前写入确定性 S3 key `{id}/file`。接管时探测：文档已存在→补建 owner 关系并置 COMPLETED；文档不存在但 S3 内容已在→跳过昂贵转换直接建文档；都不存在→重新转换。文档行 + root owner 关系 + COMPLETED 标记在**同一个事务**提交，杜绝无主半成品。
++- **向后兼容**：不带 `id` 的文件导入走旧路径（服务端生成 UUID，行为同今天）；不带文件的创建完全不变（现有 force_id 400 测试保持有效）。
++
++## 二、文件与模块
++
++### 后端
++
++- `src/backend/core/models.py`：新增 `DocumentImport` 模型（+ `ImportStatusChoices`）。
++- `src/backend/core/migrations/0034_documentimport.py`：新增迁移。
++- `src/backend/core/services/document_import_service.py`（新文件）：
++  - `ImportConflictError`（DRF APIException，HTTP 409）
++  - `compute_file_fingerprint(filename, content_type, file_bytes)`
++  - `advisory_lock_lock`/释放工具（`pg_advisory_lock(bigint)`，UUID 异或折叠为有符号 64bit）
++  - `import_document(*, creator, parent, uploaded_file, document_id, serialized_data) -> (Document, replayed)` 主编排。
++- `src/backend/core/api/serializers.py`：`validate_id` 在请求携带文件时跳过"id 已存在"硬拒绝（改由幂等服务判定重放/冲突）；无文件时行为不变。
++- `src/backend/core/api/viewsets.py`：
++  - `DocumentViewSet.create()`：文件 + id + 转换启用时走幂等服务（201 首次 / 200 重放），否则走现有 `perform_create`。
++  - `DocumentViewSet.children()` POST 分支：同样分流；保留权限继承（不建 access）与既有 posthog 属性。
++- `src/backend/core/admin.py`：注册 `DocumentImport`（只读友好，便于运维核查）。
++- 新增测试 `src/backend/core/tests/documents/test_api_documents_import_idempotency.py`。
++
++### 前端
++
++- 新文件 `src/features/docs/doc-management/utils/importId.ts`：`getImportDocumentId(file, parentId?)`（SHA-256 → uuid v5，WeakMap 按 File 缓存）。
++- `api/useImportDoc.tsx`：FormData 追加 `id`；签名支持可选 `parentId`；`onSuccess` 缓存前插按 id 去重（已存在则保持原缓存不动），成功/失败 toast 行为不变。
++- `hooks/useImport.tsx`：透传可选 `parentId`（当前调用点均为根级，不传）。
++- 新测试 `utils/__tests__/importId.test.ts`：同文件同父级身份稳定、父级不同身份不同、同 File 对象两次调用一致。
++
++## 三、实现步骤（依赖顺序）
++
++1. **模型与迁移**：新增 `DocumentImport`（id=客户端 UUID 主键、creator、parent FK、document FK、filename、file_hash(sha256,64)、content_type、status(PROCESSING/COMPLETED)、created_at/updated_at），`makemigrations` 生成 0034。
++2. **幂等服务** `document_import_service.py`：
++   - 指纹计算；advisory lock 上下文（try/finally 释放）。
++   - 短事务 A（指纹持久化）：`select_for_update` 查记录 → 无则插入 PROCESSING；并发插入撞唯一键则重查。已有记录：校验 creator/parent/filename/hash/content_type 一致，不一致抛 `ImportConflictError(409)`；COMPLETED 且 document 存在 → 直接重放。
++   - advisory lock 串行：获锁后二次读状态（双重检查）。
++   - 恢复判定：`Document.objects.filter(id=...).first()`；S3 head `{id}/file` 是否存在。
++   - 必要时调用 `Converter().convert(...)`（保留 `ConversionError` 上抛，由视图转 400），转换产物经 `default_storage` 写确定性 key。
++   - 短事务 B（原子落地）：`create_tree_node_with_retry(add_root/add_child)`；根入口 `get_or_create` OWNER access；记录置 COMPLETED 并关联 document。
++   - 首次创建发 `DOC_IMPORTED` + `DOC_CREATED`（子文档带 `document_parent` 属性）；纯重放/修复不重复发事件。
++3. **序列化器**：`validate_id` 检测 `self.initial_data.get("file")` 为真实文件时跳过 exists 拒绝。
++4. **视图分流**：新增 `create()`；重构 `children()` POST；保持错误码、headers、analytics 旧行为；转换错误仍返回 `{"file": ["Could not convert file content"]}` 400。
++5. **前端身份工具 + 接入**：useImportDoc 追加 id、可选 parentId、列表按 id 去重前插；useImport 透传。
++6. **测试与验证**（见下）。
++
++## 四、关键约束与注意事项
++
++- 子文档**不得**新建 DocumentAccess（权限继承），与现状一致。
++- 标题仍取文件名（文件名优先于显式 title）；文件大小、扩展名校验仍由 `validate_file` 负责；`CONVERSION_UPLOAD_ENABLED=False` 仍 400。
++- S3 写入不在 DB 事务内：回滚后确定性 key 上的孤儿对象会被同 id 重试覆盖，不产生多份内容。
++- advisory lock 仅做串行化，不承载状态；状态一律以 DB 记录 + S3 探测为准（崩溃后锁自动释放）。
++- 重放返回 **200** + 原始文档序列化体；首次创建仍 **201**（前端只判 `response.ok`，无需区分）。
++- 旧客户端（无 id）行为与今天完全一致，包括 force-id 已存在的 400。
++
++## 五、验证
++
++- 后端新增测试（`test_api_documents_import_idempotency.py`）：
++  1. 根：同 id + 同文件重试 → 200、仅 1 个文档、Converter 仅 1 次、owner access 仅 1 条；
++  2. 并发（ThreadPool + Event 卡住 mock 转换）同 id 同文件 → 仅 1 文档、转换仅 1 次；
++  3. 同 id 不同文件内容 / 不同文件名 → 409；同 id 根 vs 不同父级 → 409；
++  4. 转换失败后同文件重试 → 成功（记录 PROCESSING 可复用）；
++  5. 模拟"转换完成 + S3 已有内容 + 文档未建 + PROCESSING"崩溃 → 重试不调用转换、成功建文档；
++  6. 模拟"文档行存在但无 owner + PROCESSING" → 重试补 owner、重放文档；
++  7. COMPLETED 后在响应丢失场景重试 → 200 返回原文档、不重建；
++  8. 子文档：同 id 同文件重放 → 1 个子文档、无 access 行（继承不变）；
++  9. 不带 id 的旧路径与无文件创建行为不变。
++- 回归：`pytest src/backend/core/tests/documents/` 全量 + 转换服务相关测试。
++- 前端：vitest 跑新工具测试；`tsc`/eslint；手工验证（如环境可用）：重复拖拽同一文件列表只出现一次、成功 toast、标题保留扩展名、大小/扩展限制提示不变。
++
++## 六、风险
++
++- **等锁占用 worker**：同身份并发请求 B 会在 advisory lock 上阻塞至 A 完成（转换超时上限 30s 量级），与今天转换本身占 worker 的开销同级；仅影响同用户同身份，互不相关请求不受影响。
++- **S3 不可用/无 MinIO 的测试环境**：恢复探测 head_object 异常时按"内容缺失"处理（安全降级为重转），与现有 `content` getter 的容错方式一致。
++- **v5 UUID 极小概率碰撞**：身份派生冲突时服务端以 DB 记录指纹为准，碰撞表现为 409 而非错误数据。
++- **第三方客户端重放 header**：统一使用 multipart 字段 `id`，不新增 header，绕开 CSRF/代理对自定义 header 的限制。
+diff --git a/src/backend/core/admin.py b/src/backend/core/admin.py
+index e38e37f6..18869944 100644
+--- a/src/backend/core/admin.py
++++ b/src/backend/core/admin.py
+@@ -256,3 +256,39 @@ class InvitationAdmin(admin.ModelAdmin):
+     def save_model(self, request, obj, form, change):
+         obj.issuer = request.user
+         obj.save()
++
++
++@admin.register(models.DocumentImport)
++class DocumentImportAdmin(admin.ModelAdmin):
++    """Read-only admin interface to inspect idempotent file import records."""
++
++    fields = (
++        "id",
++        "creator",
++        "parent",
++        "document",
++        "filename",
++        "file_hash",
++        "content_type",
++        "status",
++        "created_at",
++        "updated_at",
++    )
++    readonly_fields = fields
++    list_display = (
++        "id",
++        "filename",
++        "creator",
++        "parent",
++        "document",
++        "status",
++        "created_at",
++    )
++    list_filter = ("status",)
++    search_fields = ("id", "filename", "file_hash")
++
++    def has_add_permission(self, request):
++        return False
++
++    def has_delete_permission(self, request, obj=None):
++        return False
+diff --git a/src/backend/core/api/serializers.py b/src/backend/core/api/serializers.py
+index fb35ca9a..4d240e3c 100644
+--- a/src/backend/core/api/serializers.py
++++ b/src/backend/core/api/serializers.py
+@@ -256,7 +256,13 @@ class DocumentSerializer(ListDocumentSerializer):
+                     "The provided ID is not a valid UUID."
+                 )
+ 
+-            if models.Document.objects.filter(id=value).exists():
++            # File imports carry a replayable identity: when the same identity
++            # is resubmitted with the same file, the view returns the original
++            # document instead of rejecting it. The idempotency layer is
++            # responsible for rejecting identities replayed with a different
++            # file or target parent.
++            uploaded_file = self.initial_data.get("file")
++            if not uploaded_file and models.Document.objects.filter(id=value).exists():
+                 raise serializers.ValidationError(
+                     "A document with this ID already exists. You cannot override it."
+                 )
+diff --git a/src/backend/core/api/viewsets.py b/src/backend/core/api/viewsets.py
+index be0a1ceb..50239f1a 100644
+--- a/src/backend/core/api/viewsets.py
++++ b/src/backend/core/api/viewsets.py
+@@ -54,6 +54,7 @@ from core.services import mime_types
+ from core.services.ai_services.blocknote import AIService
+ from core.services.ai_services.legacy import get_legacy_ai_service
+ from core.services.collaboration_services import CollaborationService
++from core.services import document_import_service
+ from core.services.converter_services import (
+     ConversionError,
+     Converter,
+@@ -734,6 +735,76 @@ class DocumentViewSet(
+                     {"file": ["Could not convert file content"]}
+                 ) from err
+ 
++    def _run_idempotent_import(self, serializer, parent):
++        """
++        Run a file import through the idempotency layer when the request
++        carries a replayable identity.
++
++        Returns ``(document, replayed)`` or ``None`` when the request must go
++        through the legacy creation flow (no file, conversion disabled, or no
++        client-provided identity).
++        """
++        uploaded_file = serializer.validated_data.get("file")
++        if not uploaded_file or not settings.CONVERSION_UPLOAD_ENABLED:
++            return None
++
++        document_id, node_kwargs = document_import_service.resolve_import_identity(
++            serializer.validated_data
++        )
++        if document_id is None:
++            return None
++
++        try:
++            return document_import_service.import_document(
++                creator=self.request.user,
++                parent=parent,
++                uploaded_file=uploaded_file,
++                document_id=document_id,
++                node_kwargs=node_kwargs,
++            )
++        except ConversionError as err:
++            logger.error("could not convert file content with error: %s", err)
++            raise drf.exceptions.ValidationError(
++                {"file": ["Could not convert file content"]}
++            ) from err
++
++    def _track_idempotent_import(self, serializer, parent, document):
++        """Emit import/creation analytics for a newly created import only."""
++        posthog_capture(
++            PosthogEventName.DOC_IMPORTED,
++            self.request.user,
++            {"content_type": serializer.validated_data["file"].content_type},
++        )
++        posthog_capture(
++            PosthogEventName.DOC_CREATED,
++            self.request.user,
++            {"document_parent": str(parent.id)} if parent is not None else {},
++            document=document,
++        )
++
++    def create(self, request, *args, **kwargs):
++        """Create a root document, replaying idempotent file imports."""
++        serializer = self.get_serializer(data=request.data)
++        serializer.is_valid(raise_exception=True)
++
++        idempotent_result = self._run_idempotent_import(serializer, parent=None)
++        if idempotent_result is not None:
++            document, replayed = idempotent_result
++            serializer.instance = document
++            response_status = (
++                status.HTTP_200_OK if replayed else status.HTTP_201_CREATED
++            )
++            if not replayed:
++                self._track_idempotent_import(serializer, None, document)
++        else:
++            self.perform_create(serializer)
++            response_status = status.HTTP_201_CREATED
++
++        headers = self.get_success_headers(serializer.data)
++        return drf.response.Response(
++            serializer.data, status=response_status, headers=headers
++        )
++
+     def perform_create(self, serializer):
+         """Set the current user as creator and owner of the newly created object."""
+ 
+@@ -1102,28 +1173,42 @@ class DocumentViewSet(
+             )
+             serializer.is_valid(raise_exception=True)
+ 
+-            self._apply_uploaded_file_conversion(serializer)
++            idempotent_result = self._run_idempotent_import(
++                serializer, parent=document
++            )
++            if idempotent_result is not None:
++                child_document, replayed = idempotent_result
++                response_status = (
++                    status.HTTP_200_OK if replayed else status.HTTP_201_CREATED
++                )
++                if not replayed:
++                    self._track_idempotent_import(
++                        serializer, document, child_document
++                    )
++            else:
++                self._apply_uploaded_file_conversion(serializer)
+ 
+-            child_document = create_tree_node_with_retry(
+-                lambda: document.add_child(
+-                    creator=request.user,
+-                    **serializer.validated_data,
++                child_document = create_tree_node_with_retry(
++                    lambda: document.add_child(
++                        creator=request.user,
++                        **serializer.validated_data,
++                    )
++                )
++                response_status = status.HTTP_201_CREATED
++
++                posthog_capture(
++                    PosthogEventName.DOC_CREATED,
++                    self.request.user,
++                    {"document_parent": str(document.id)},
++                    document=child_document,
+                 )
+-            )
+ 
+             # Set the created instance to the serializer
+             serializer.instance = child_document
+ 
+-            posthog_capture(
+-                PosthogEventName.DOC_CREATED,
+-                self.request.user,
+-                {"document_parent": str(document.id)},
+-                document=child_document,
+-            )
+-
+             headers = self.get_success_headers(serializer.data)
+             return drf.response.Response(
+-                serializer.data, status=status.HTTP_201_CREATED, headers=headers
++                serializer.data, status=response_status, headers=headers
+             )
+ 
+         # GET: List children
+diff --git a/src/backend/core/migrations/0034_documentimport.py b/src/backend/core/migrations/0034_documentimport.py
+new file mode 100644
+index 00000000..ef4f6fb2
+--- /dev/null
++++ b/src/backend/core/migrations/0034_documentimport.py
+@@ -0,0 +1,113 @@
++# Generated for idempotent DOCX/Markdown document imports
++
++import uuid
++
++import django.db.models.deletion
++from django.conf import settings
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("core", "0033_document_document_attachments_gin"),
++        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name="DocumentImport",
++            fields=[
++                (
++                    "id",
++                    models.UUIDField(
++                        default=uuid.uuid4,
++                        editable=False,
++                        help_text="primary key for the record as UUID",
++                        primary_key=True,
++                        serialize=False,
++                        verbose_name="id",
++                    ),
++                ),
++                (
++                    "created_at",
++                    models.DateTimeField(
++                        auto_now_add=True,
++                        editable=False,
++                        help_text="date and time at which a record was created",
++                        verbose_name="created on",
++                    ),
++                ),
++                (
++                    "updated_at",
++                    models.DateTimeField(
++                        auto_now=True,
++                        editable=False,
++                        help_text="date and time at which a record was last updated",
++                        verbose_name="updated on",
++                    ),
++                ),
++                ("filename", models.CharField(max_length=255, verbose_name="filename")),
++                (
++                    "file_hash",
++                    models.CharField(max_length=64, verbose_name="file hash"),
++                ),
++                (
++                    "content_type",
++                    models.CharField(blank=True, max_length=255, verbose_name="content type"),
++                ),
++                (
++                    "status",
++                    models.CharField(
++                        choices=[
++                            ("processing", "Processing"),
++                            ("completed", "Completed"),
++                        ],
++                        default="processing",
++                        max_length=20,
++                    ),
++                ),
++                (
++                    "creator",
++                    models.ForeignKey(
++                        on_delete=django.db.models.deletion.CASCADE,
++                        related_name="document_imports",
++                        to=settings.AUTH_USER_MODEL,
++                        verbose_name="creator",
++                    ),
++                ),
++                (
++                    "parent",
++                    models.ForeignKey(
++                        blank=True,
++                        null=True,
++                        on_delete=django.db.models.deletion.CASCADE,
++                        related_name="child_imports",
++                        to="core.document",
++                        verbose_name="parent document",
++                    ),
++                ),
++                (
++                    "document",
++                    models.ForeignKey(
++                        blank=True,
++                        null=True,
++                        on_delete=django.db.models.deletion.CASCADE,
++                        related_name="import_records",
++                        to="core.document",
++                        verbose_name="imported document",
++                    ),
++                ),
++            ],
++            options={
++                "verbose_name": "Document import",
++                "verbose_name_plural": "Document imports",
++                "db_table": "impress_document_import",
++            },
++        ),
++        migrations.AddIndex(
++            model_name="documentimport",
++            index=models.Index(
++                fields=["creator", "status"], name="document_import_creator"
++            ),
++        ),
++    ]
+diff --git a/src/backend/core/models.py b/src/backend/core/models.py
+index a18c66a9..8c50484d 100644
+--- a/src/backend/core/models.py
++++ b/src/backend/core/models.py
+@@ -2134,3 +2134,71 @@ class Invitation(BaseModel):
+             "partial_update": is_admin_or_owner,
+             "retrieve": is_admin_or_owner,
+         }
++
++
++class DocumentImportStatusChoices(models.TextChoices):
++    """Statuses of an idempotent document import request."""
++
++    PROCESSING = "processing", _("Processing")
++    COMPLETED = "completed", _("Completed")
++
++
++class DocumentImport(BaseModel):
++    """
++    Idempotency record for a DOCX/Markdown file import.
++
++    The primary key is the replayable identity of the import, provided by the
++    client as the target document ID. It is shared by the root document entry
++    (``POST /documents/``) and the child document entry
++    (``POST /documents/<id>/children/``).
++
++    The record is persisted (PROCESSING) before the expensive conversion runs,
++    so that retries after a conversion failure or a crash reuse it: same
++    identity with a different file or target parent is rejected, while the
++    same identity with the same file resumes the import from a determined
++    state. Once the document and, for root documents, the owner relation are
++    committed together, the record switches to COMPLETED and subsequent
++    requests return the original document.
++    """
++
++    creator = models.ForeignKey(
++        User,
++        on_delete=models.CASCADE,
++        related_name="document_imports",
++        verbose_name=_("creator"),
++    )
++    parent = models.ForeignKey(
++        Document,
++        on_delete=models.CASCADE,
++        related_name="child_imports",
++        verbose_name=_("parent document"),
++        blank=True,
++        null=True,
++    )
++    document = models.ForeignKey(
++        Document,
++        on_delete=models.CASCADE,
++        related_name="import_records",
++        verbose_name=_("imported document"),
++        blank=True,
++        null=True,
++    )
++    filename = models.CharField(_("filename"), max_length=255)
++    file_hash = models.CharField(_("file hash"), max_length=64)
++    content_type = models.CharField(_("content type"), max_length=255, blank=True)
++    status = models.CharField(
++        max_length=20,
++        choices=DocumentImportStatusChoices.choices,
++        default=DocumentImportStatusChoices.PROCESSING,
++    )
++
++    class Meta:
++        db_table = "impress_document_import"
++        verbose_name = _("Document import")
++        verbose_name_plural = _("Document imports")
++        indexes = [
++            models.Index(fields=["creator", "status"], name="document_import_creator"),
++        ]
++
++    def __str__(self):
++        return f"Import {self.id!s} ({self.filename})"
+diff --git a/src/backend/core/services/document_import_service.py b/src/backend/core/services/document_import_service.py
+new file mode 100644
+index 00000000..bf0a1448
+--- /dev/null
++++ b/src/backend/core/services/document_import_service.py
+@@ -0,0 +1,333 @@
++"""
++Idempotent DOCX/Markdown document import orchestration.
++
++A file import carries a client-provided identity (the target document UUID).
++This module makes importing the same identity with the same file and target
++parent replayable at both the root document and child document entries:
++
++* the request fingerprint (creator, parent, filename, content type and file
++  hash) is persisted before the expensive conversion runs;
++* concurrent requests sharing an identity are serialized with a PostgreSQL
++  advisory lock, so the conversion and the document creation run once;
++* an identity reused with a different file or a different target parent is
++  explicitly rejected (HTTP 409);
++* conversion failures and creation transaction rollbacks leave the record in
++  PROCESSING state, from which a retry with the same file resumes;
++* after a crash between the conversion, the content storage, the root
++  document owner relation and the response delivery, the state is recovered
++  from durable facts: the import record, the document row and the
++  deterministic ``{document_id}/file`` object in storage.
++"""
++
++import contextlib
++import hashlib
++import logging
++
++from django.core.files.base import ContentFile
++from django.core.files.storage import default_storage
++from django.db import IntegrityError, connection, transaction
++from django.utils.translation import gettext_lazy as _
++
++import rest_framework as drf
++from botocore.exceptions import ClientError
++from rest_framework import status
++
++from core import models
++from core.services import mime_types
++from core.services.converter_services import Converter
++from core.utils.treebeard import create_tree_node_with_retry
++
++logger = logging.getLogger(__name__)
++
++_UINT64_MASK = (1 << 64) - 1
++_SIGNED_64_THRESHOLD = 1 << 63
++_SIGNED_64_OFFSET = 1 << 64
++
++
++class ImportConflictError(drf.exceptions.APIException):
++    """Raised when an import identity is reused with different parameters."""
++
++    status_code = status.HTTP_409_CONFLICT
++    default_detail = _(
++        "This import identity was already used with a different file or target parent."
++    )
++    default_code = "import_conflict"
++
++
++def compute_file_fingerprint(filename, content_type, file_bytes):
++    """Return the SHA-256 fingerprint of an uploaded file."""
++    digest = hashlib.sha256()
++    digest.update((filename or "").encode("utf-8"))
++    digest.update(b"\x00")
++    digest.update((content_type or "").encode("utf-8"))
++    digest.update(b"\x00")
++    digest.update(file_bytes)
++    return digest.hexdigest()
++
++
++def _advisory_lock_key(lock_uuid):
++    """Fold a 128-bit UUID into a signed 64-bit advisory lock key."""
++    value = ((lock_uuid.int >> 64) ^ (lock_uuid.int & _UINT64_MASK)) & _UINT64_MASK
++    if value >= _SIGNED_64_THRESHOLD:
++        return value - _SIGNED_64_OFFSET
++    return value
++
++
++@contextlib.contextmanager
++def advisory_lock_for_import(lock_uuid):
++    """
++    Serialize requests sharing an import identity.
++
++    Session-level advisory locks are automatically released by PostgreSQL
++    when the database connection closes, so a crashed worker never holds the
++    lock: a retry acquires it and resumes from the durable state.
++    """
++    lock_key = _advisory_lock_key(lock_uuid)
++    with connection.cursor() as cursor:
++        cursor.execute("SELECT pg_advisory_lock(%s)", [lock_key])
++        try:
++            yield
++        finally:
++            cursor.execute("SELECT pg_advisory_unlock(%s)", [lock_key])
++
++
++def _content_file_key(document_id):
++    """Object storage key at which the converted content of a document lives."""
++    return f"{document_id!s}/file"
++
++
++def imported_content_exists(document_id):
++    """Return True when converted content is already stored for the identity."""
++    try:
++        default_storage.connection.meta.client.head_object(
++            Bucket=default_storage.bucket_name,
++            Key=_content_file_key(document_id),
++        )
++    except ClientError as excpt:
++        if excpt.response["Error"]["Code"] == "404":
++            return False
++        raise
++    return True
++
++
++def _store_imported_content(document_id, converted_content):
++    """Persist converted content at the deterministic key before the DB commit."""
++    default_storage.save(
++        _content_file_key(document_id),
++        ContentFile(converted_content.encode("utf-8")),
++    )
++
++
++def _ensure_record_matches(record, *, creator, parent, fingerprint):
++    """Reject identities reused with a different file or target parent."""
++    filename, content_type, file_hash = fingerprint
++    if (
++        record.creator_id != creator.id
++        or record.parent_id != (parent.id if parent is not None else None)
++        or record.filename != filename
++        or record.file_hash != file_hash
++        or record.content_type != (content_type or "")
++    ):
++        logger.info(
++            "import identity %s reused with conflicting parameters", record.id
++        )
++        raise ImportConflictError()
++
++
++def _register_import(*, creator, parent, document_id, fingerprint):
++    """
++    Persist the import fingerprint before conversion (short transaction).
++
++    Returns the record and whether it was just created. A record is kept on
++    conversion failure or creation rollback so that retries are allowed with
++    the same file while a different file is rejected.
++    """
++    filename, content_type, file_hash = fingerprint
++    with transaction.atomic():
++        record = (
++            models.DocumentImport.objects.select_for_update()
++            .filter(id=document_id)
++            .first()
++        )
++        if record is None:
++            try:
++                record = models.DocumentImport.objects.create(
++                    id=document_id,
++                    creator=creator,
++                    parent=parent,
++                    document=None,
++                    filename=filename,
++                    file_hash=file_hash,
++                    content_type=content_type or "",
++                    status=models.DocumentImportStatusChoices.PROCESSING,
++                )
++            except IntegrityError:
++                # A concurrent request may have won the insert race: re-read
++                # the row instead of failing.
++                record = (
++                    models.DocumentImport.objects.select_for_update()
++                    .filter(id=document_id)
++                    .first()
++                )
++                if record is None:
++                    raise
++                _ensure_record_matches(
++                    record,
++                    creator=creator,
++                    parent=parent,
++                    fingerprint=fingerprint,
++                )
++                return record, False
++
++            # A record is only legitimately created before the document. If a
++            # document already exists without any import record, the identity
++            # belongs to an unrelated document and must not be claimed.
++            if models.Document.objects.filter(id=document_id).exists():
++                raise ImportConflictError()
++            return record, True
++
++        _ensure_record_matches(
++            record,
++            creator=creator,
++            parent=parent,
++            fingerprint=fingerprint,
++        )
++        return record, False
++
++
++def _create_document_node(*, parent, document_id, filename, node_kwargs, creator):
++    """Create the root or child document node inside the caller transaction."""
++    attributes = {
++        **node_kwargs,
++        "id": document_id,
++        "title": filename,
++        "creator": creator,
++    }
++    if parent is None:
++        return create_tree_node_with_retry(
++            lambda: models.Document.add_root(**attributes)
++        )
++    return create_tree_node_with_retry(lambda: parent.add_child(**attributes))
++
++
++def import_document(*, creator, parent, uploaded_file, document_id, node_kwargs):
++    """
++    Import an uploaded file idempotently.
++
++    Returns ``(document, replayed)`` where ``replayed`` is True when the
++    import had already completed and the original document is returned.
++    """
++    file_bytes = uploaded_file.read()
++    filename = uploaded_file.name
++    content_type = uploaded_file.content_type or ""
++    fingerprint = (
++        filename,
++        content_type,
++        compute_file_fingerprint(filename, content_type, file_bytes),
++    )
++
++    record, _created = _register_import(
++        creator=creator,
++        parent=parent,
++        document_id=document_id,
++        fingerprint=fingerprint,
++    )
++
++    # The import already completed before (e.g. the response was lost):
++    # return the original document without converting again.
++    if (
++        record.status == models.DocumentImportStatusChoices.COMPLETED
++        and record.document_id is not None
++    ):
++        return record.document, True
++
++    with advisory_lock_for_import(document_id):
++        # Re-read after acquiring the lock: a concurrent request may have
++        # completed the import while we were waiting.
++        record = models.DocumentImport.objects.get(id=document_id)
++        _ensure_record_matches(
++            record,
++            creator=creator,
++            parent=parent,
++            fingerprint=fingerprint,
++        )
++        if (
++            record.status == models.DocumentImportStatusChoices.COMPLETED
++            and record.document_id is not None
++        ):
++            return record.document, True
++
++        document = models.Document.objects.filter(id=document_id).first()
++
++        if document is None:
++            # Either no work was ever done, or the process crashed after the
++            # conversion and the content storage but before the document row
++            # was committed. Stored content lets us skip the expensive
++            # conversion in the latter case.
++            if not imported_content_exists(document_id):
++                converted_content = Converter().convert(
++                    file_bytes,
++                    content_type=content_type,
++                    accept=mime_types.YJS,
++                )
++                _store_imported_content(document_id, converted_content)
++
++            with transaction.atomic():
++                document = _create_document_node(
++                    parent=parent,
++                    document_id=document_id,
++                    filename=filename,
++                    node_kwargs=node_kwargs,
++                    creator=creator,
++                )
++                if parent is None:
++                    # Root documents own themselves: commit the owner relation
++                    # in the same transaction as the document row so that no
++                    # ownerless half-finished document can ever be visible.
++                    models.DocumentAccess.objects.get_or_create(
++                        document=document,
++                        user=creator,
++                        defaults={"role": models.RoleChoices.OWNER},
++                    )
++                record.document = document
++                record.status = models.DocumentImportStatusChoices.COMPLETED
++                record.save(
++                    update_fields=["document", "status", "updated_at"]
++                )
++
++            return document, False
++
++        # The document row exists but the record is still PROCESSING: the
++        # process crashed during creation. Complete the missing steps instead
++        # of creating a duplicate.
++        with transaction.atomic():
++            if parent is None:
++                models.DocumentAccess.objects.get_or_create(
++                    document=document,
++                    user=creator,
++                    defaults={"role": models.RoleChoices.OWNER},
++                )
++            record.document = document
++            record.status = models.DocumentImportStatusChoices.COMPLETED
++            record.save(update_fields=["document", "status", "updated_at"])
++
++        logger.info("import %s recovered from a half-finished state", document_id)
++        return document, True
++
++
++def resolve_import_identity(validated_data):
++    """
++    Extract the replayable identity and safe node attributes from validated
++    serializer data.
++
++    Returns ``(document_id, node_kwargs)`` or ``(None, node_kwargs)`` when the
++    request does not carry an identity (legacy clients).
++    """
++    node_kwargs = dict(validated_data)
++    node_kwargs.pop("file", None)
++    node_kwargs.pop("websocket", None)
++    document_id = node_kwargs.pop("id", None)
++    # The filename always wins over any provided title, mirroring the legacy
++    # conversion behavior; the view sets it from the uploaded file name.
++    node_kwargs.pop("title", None)
++    return document_id, node_kwargs
+diff --git a/src/backend/core/tests/documents/test_api_documents_import_idempotency.py b/src/backend/core/tests/documents/test_api_documents_import_idempotency.py
+new file mode 100644
+index 00000000..b0cd938c
+--- /dev/null
++++ b/src/backend/core/tests/documents/test_api_documents_import_idempotency.py
+@@ -0,0 +1,494 @@
++"""
++Tests for idempotent DOCX/Markdown imports on the documents endpoints.
++
++The replayable identity is the client-provided document ID: retrying the same
++identity with the same file and target parent returns the original document,
++concurrent requests run the conversion once, an identity reused with a
++different file or target parent is rejected, and failed/interrupted imports
++can be safely retried.
++"""
++
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from io import BytesIO
++from types import SimpleNamespace
++from unittest import mock
++from unittest.mock import patch
++from uuid import uuid4
++
++from django.db import connection
++
++import pytest
++from botocore.exceptions import ClientError
++from botocore.response import StreamingBody
++from rest_framework.test import APIClient
++
++from core import factories, models
++from core.services import mime_types
++from core.services.converter_services import ConversionError
++from core.services.document_import_service import (
++    _store_imported_content,
++    compute_file_fingerprint,
++)
++from core.utils.analytics import PosthogEventName
++
++pytestmark = pytest.mark.django_db
++
++
++class _FakeS3Client:
++    """Minimal in-memory S3 client (head/get object) for hermetic tests."""
++
++    def __init__(self, objects):
++        self.objects = objects
++
++    @staticmethod
++    def _not_found(operation):
++        return ClientError(
++            {"Error": {"Code": "404", "Message": "Not Found"}}, operation
++        )
++
++    def head_object(self, **kwargs):
++        """Mimic boto3 head_object, returning a 404 error for unknown keys."""
++        key = kwargs["Key"]
++        if key not in self.objects:
++            raise self._not_found("HeadObject")
++        return {"ETag": '"unused"'}
++
++    def get_object(self, **kwargs):
++        """Mimic boto3 get_object with a streaming body."""
++        key = kwargs["Key"]
++        if key not in self.objects:
++            raise self._not_found("GetObject")
++        data = self.objects[key]
++        return {"Body": StreamingBody(BytesIO(data), len(data))}
++
++
++class _FakeStorage:
++    """In-memory storage exposing the S3 boto3 connection used by models."""
++
++    bucket_name = "test-bucket"
++
++    def __init__(self):
++        self.objects = {}
++        self.connection = SimpleNamespace(
++            meta=SimpleNamespace(client=_FakeS3Client(self.objects))
++        )
++
++    def save(self, name, content, max_length=None):
++        """Store the file content in memory (Django storage API)."""
++        _ = max_length
++        self.objects[name] = content.read()
++        return name
++
++
++@pytest.fixture(autouse=True)
++def s3_storage():
++    """Replace S3-backed storage for the import tests (shared by model/service)."""
++    storage = _FakeStorage()
++    with (
++        mock.patch("core.models.default_storage", storage),
++        mock.patch(
++            "core.services.document_import_service.default_storage", storage
++        ),
++    ):
++        yield storage
++    storage.objects.clear()
++
++FILENAME = "My Important Document.docx"
++FILE_CONTENT = b"fake docx content"
++CONVERTED_YJS = "base64encodedyjscontent"
++
++
++def make_file(content=FILE_CONTENT, name=FILENAME):
++    """Build a fake uploaded DOCX file."""
++    file_obj = BytesIO(content)
++    file_obj.name = name
++    return file_obj
++
++
++def fingerprint(
++    file_content=FILE_CONTENT,
++    filename=FILENAME,
++    content_type=mime_types.DOCX,
++):
++    """Compute the import fingerprint expected on the DocumentImport record."""
++    return compute_file_fingerprint(filename, content_type, file_content)
++
++
++def owner_access_count(user):
++    """Count owner accesses of a user."""
++    return models.DocumentAccess.objects.filter(user=user, role="owner").count()
++
++
++def post_import(client, import_id, *, file_obj=None, parent_id=None, **payload):
++    """Post a file import (root or child) with the given identity."""
++    payload.setdefault("file", file_obj if file_obj is not None else make_file())
++    if import_id is not None:
++        payload["id"] = str(import_id)
++    url = (
++        f"/api/v1.0/documents/{parent_id!s}/children/"
++        if parent_id is not None
++        else "/api/v1.0/documents/"
++    )
++    return client.post(url, payload, format="multipart")
++
++
++@pytest.fixture(name="import_user")
++def import_user_fixture():
++    """Create a logged-in API client with its user."""
++    user = factories.UserFactory()
++    client = APIClient()
++    client.force_login(user)
++    return user, client
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_root_replays_same_identity(mock_convert, settings, import_user):
++    """Retrying the same identity with the same file returns the original document."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    user, client = import_user
++    import_id = uuid4()
++
++    with patch("core.api.viewsets.posthog_capture") as mock_capture:
++        response1 = post_import(client, import_id)
++        response2 = post_import(client, import_id)
++
++    assert response1.status_code == 201
++    assert response2.status_code == 200
++
++    assert response1.json()["id"] == str(import_id)
++    assert response2.json()["id"] == str(import_id)
++
++    documents = models.Document.objects.all()
++    assert len(documents) == 1
++    document = documents[0]
++    assert document.id == import_id
++    assert document.title == FILENAME
++    assert document.content == CONVERTED_YJS
++    assert document.accesses.filter(role="owner", user=user).count() == 1
++
++    # The expensive conversion runs only once.
++    mock_convert.assert_called_once_with(
++        FILE_CONTENT, content_type=mime_types.DOCX, accept=mime_types.YJS
++    )
++
++    # Analytics are emitted once, on the actual creation, never on replay.
++    assert mock_capture.call_count == 2
++    mock_capture.assert_any_call(
++        PosthogEventName.DOC_IMPORTED,
++        user,
++        {"content_type": mime_types.DOCX},
++    )
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_without_identity_keeps_legacy_behavior(mock_convert, settings, import_user):
++    """Clients that do not provide an identity keep the historical behavior."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    user, client = import_user
++
++    response = post_import(client, None)
++
++    assert response.status_code == 201
++    assert models.Document.objects.count() == 1
++    assert models.DocumentImport.objects.count() == 0
++    assert owner_access_count(user) == 1
++
++
++@pytest.mark.django_db(transaction=True)
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_root_concurrent_submitted_once(mock_convert, settings, import_user):
++    """Two concurrent requests with the same identity convert and create once."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    user, _client = import_user
++    import_id = uuid4()
++
++    entered = threading.Event()
++
++    def convert_side_effect(_data, _content_type, _accept):
++        entered.set()
++        # Give the second request time to reach the advisory lock.
++        time.sleep(0.5)
++        return CONVERTED_YJS
++
++    mock_convert.side_effect = convert_side_effect
++
++    def submit():
++        client = APIClient()
++        client.force_login(user)
++        try:
++            return post_import(client, import_id)
++        finally:
++            connection.close()
++
++    with ThreadPoolExecutor(max_workers=2) as executor:
++        future1 = executor.submit(submit)
++        # Ensure the first request has entered conversion before firing the
++        # concurrent duplicate.
++        assert entered.wait(timeout=5)
++        future2 = executor.submit(submit)
++        response1 = future1.result()
++        response2 = future2.result()
++
++    assert response1.status_code == 201
++    assert response2.status_code == 200
++    assert response1.json()["id"] == response2.json()["id"] == str(import_id)
++
++    assert models.Document.objects.filter(id=import_id).count() == 1
++    assert (
++        models.DocumentAccess.objects.filter(
++            document_id=import_id, user=user, role="owner"
++        ).count()
++        == 1
++    )
++    mock_convert.assert_called_once()
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_same_identity_different_file_rejected(
++    mock_convert, settings, import_user
++):
++    """The same identity with different file content is explicitly rejected."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    _user, client = import_user
++    import_id = uuid4()
++
++    response1 = post_import(client, import_id)
++    assert response1.status_code == 201
++
++    response2 = post_import(client, import_id, file_obj=make_file(b"different bytes"))
++    assert response2.status_code == 409
++
++    assert models.Document.objects.count() == 1
++    mock_convert.assert_called_once()
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_same_identity_different_filename_rejected(
++    mock_convert, settings, import_user
++):
++    """The same identity with a different file name is explicitly rejected."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    _user, client = import_user
++    import_id = uuid4()
++
++    response1 = post_import(client, import_id)
++    assert response1.status_code == 201
++
++    response2 = post_import(
++        client, import_id, file_obj=make_file(FILE_CONTENT, "another.docx")
++    )
++    assert response2.status_code == 409
++    assert models.Document.objects.count() == 1
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_same_identity_different_parent_rejected(
++    mock_convert, settings, import_user
++):
++    """The same identity cannot be reused against a different target parent."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    user, client = import_user
++    import_id = uuid4()
++
++    response_root = post_import(client, import_id)
++    assert response_root.status_code == 201
++
++    parent = factories.DocumentFactory(creator=user, users=[(user, "owner")])
++    response_child = post_import(client, import_id, parent_id=parent.id)
++    assert response_child.status_code == 409
++
++    # No child was created under the parent.
++    parent.refresh_from_db()
++    assert parent.get_children().count() == 0
++    assert models.Document.objects.filter(id=import_id).count() == 1
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_retry_after_conversion_failure(mock_convert, settings, import_user):
++    """A conversion failure leaves a reusable record: the same file retries safely."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.side_effect = [
++        ConversionError("boom"),
++        CONVERTED_YJS,
++    ]
++    user, client = import_user
++    import_id = uuid4()
++
++    with patch("core.api.viewsets.posthog_capture") as mock_capture:
++        response1 = post_import(client, import_id)
++        assert response1.status_code == 400
++        assert response1.json() == {"file": ["Could not convert file content"]}
++
++        # The failure left no document but a fingerprint record in PROCESSING.
++        assert models.Document.objects.filter(id=import_id).count() == 0
++        record = models.DocumentImport.objects.get(id=import_id)
++        assert record.status == models.DocumentImportStatusChoices.PROCESSING
++
++        response2 = post_import(client, import_id)
++        assert response2.status_code == 201
++
++    document = models.Document.objects.get(id=import_id)
++    assert document.content == CONVERTED_YJS
++    assert document.accesses.filter(role="owner", user=user).exists()
++    assert mock_convert.call_count == 2
++
++    record.refresh_from_db()
++    assert record.status == models.DocumentImportStatusChoices.COMPLETED
++    assert record.document == document
++
++    # Analytics fire only for the successful attempt.
++    assert mock_capture.call_count == 2
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_retry_after_crash_with_stored_content(
++    mock_convert, settings, import_user
++):
++    """
++    Crash after conversion + content storage but before the document row:
++    the retry resumes without running the conversion again.
++    """
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    user, client = import_user
++    import_id = uuid4()
++
++    models.DocumentImport.objects.create(
++        id=import_id,
++        creator=user,
++        parent=None,
++        filename=FILENAME,
++        file_hash=fingerprint(),
++        content_type=mime_types.DOCX,
++        status=models.DocumentImportStatusChoices.PROCESSING,
++    )
++    # Simulate converted content already persisted at the deterministic key.
++    _store_imported_content(import_id, CONVERTED_YJS)
++
++    response = post_import(client, import_id)
++
++    assert response.status_code == 201
++    mock_convert.assert_not_called()
++    document = models.Document.objects.get(id=import_id)
++    assert document.content == CONVERTED_YJS
++    assert document.title == FILENAME
++    assert document.accesses.filter(role="owner", user=user).exists()
++
++    record = models.DocumentImport.objects.get(id=import_id)
++    assert record.status == models.DocumentImportStatusChoices.COMPLETED
++    assert record.document == document
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_retry_heals_ownerless_document(
++    mock_convert, settings, import_user
++):
++    """
++    Crash after the document row commit but before the owner relation:
++    the retry completes the missing owner access and returns the document.
++    """
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    user, client = import_user
++    import_id = uuid4()
++
++    document = factories.DocumentFactory(
++        id=import_id, creator=user, title=FILENAME
++    )
++    assert document.accesses.exists() is False
++
++    models.DocumentImport.objects.create(
++        id=import_id,
++        creator=user,
++        parent=None,
++        document=document,
++        filename=FILENAME,
++        file_hash=fingerprint(),
++        content_type=mime_types.DOCX,
++        status=models.DocumentImportStatusChoices.PROCESSING,
++    )
++
++    response = post_import(client, import_id)
++
++    assert response.status_code == 200
++    assert response.json()["id"] == str(import_id)
++    mock_convert.assert_not_called()
++    assert models.Document.objects.filter(id=import_id).count() == 1
++    assert document.accesses.filter(role="owner", user=user).count() == 1
++
++    record = models.DocumentImport.objects.get(id=import_id)
++    assert record.status == models.DocumentImportStatusChoices.COMPLETED
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_identity_of_unrelated_document_rejected(
++    mock_convert, settings, import_user
++):
++    """An identity matching an existing document without import record is refused."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    user, client = import_user
++    foreign_document = factories.DocumentFactory()
++
++    response = post_import(client, foreign_document.id)
++
++    assert response.status_code == 409
++    mock_convert.assert_not_called()
++    # No owner access was granted on the foreign document.
++    assert not foreign_document.accesses.filter(user=user).exists()
++    assert models.DocumentImport.objects.filter(id=foreign_document.id).count() == 0
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_child_replays_same_identity(mock_convert, settings, import_user):
++    """Child imports replay the original child and keep permission inheritance."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    user, client = import_user
++    import_id = uuid4()
++    parent = factories.DocumentFactory(creator=user, users=[(user, "owner")])
++
++    response1 = post_import(client, import_id, parent_id=parent.id)
++    response2 = post_import(client, import_id, parent_id=parent.id)
++
++    assert response1.status_code == 201
++    assert response2.status_code == 200
++    assert response1.json()["id"] == response2.json()["id"] == str(import_id)
++
++    parent.refresh_from_db()
++    children = parent.get_children()
++    assert children.count() == 1
++    child = children.get()
++    assert child.id == import_id
++    assert child.title == FILENAME
++    assert child.content == CONVERTED_YJS
++    # Children inherit permissions: no direct access row is created.
++    assert child.accesses.exists() is False
++
++    mock_convert.assert_called_once()
++
++    record = models.DocumentImport.objects.get(id=import_id)
++    assert record.parent_id == parent.id
++    assert record.status == models.DocumentImportStatusChoices.COMPLETED
++
++
++@patch("core.services.document_import_service.Converter.convert")
++def test_import_completed_record_replays_after_response_lost(
++    mock_convert, settings, import_user
++):
++    """A COMPLETED record replays even when the original response never landed."""
++    settings.CONVERSION_UPLOAD_ENABLED = True
++    mock_convert.return_value = CONVERTED_YJS
++    _user, client = import_user
++    import_id = uuid4()
++
++    assert post_import(client, import_id).status_code == 201
++    assert post_import(client, import_id).status_code == 200
++    assert post_import(client, import_id).status_code == 200
++
++    assert models.Document.objects.filter(id=import_id).count() == 1
++    assert mock_convert.call_count == 1
+diff --git a/src/frontend/apps/impress/src/features/docs/doc-management/api/useImportDoc.tsx b/src/frontend/apps/impress/src/features/docs/doc-management/api/useImportDoc.tsx
+index 9f4b48ce..c1ad93d1 100644
+--- a/src/frontend/apps/impress/src/features/docs/doc-management/api/useImportDoc.tsx
++++ b/src/frontend/apps/impress/src/features/docs/doc-management/api/useImportDoc.tsx
+@@ -15,6 +15,7 @@ import {
+ import { useToast } from '@/hooks';
+ 
+ import { Doc } from '../types';
++import { getImportDocumentId } from '../utils/importId';
+ 
+ import { DocsResponse, KEY_LIST_DOC } from './useDocs';
+ 
+@@ -42,9 +43,10 @@ export const ContentTypes: {
+   },
+ };
+ 
+-export const importDoc = async ([file, mimeType]: [
++export const importDoc = async ([file, mimeType, parentId]: [
+   File,
+   string,
++  string?,
+ ]): Promise<Doc> => {
+   const form = new FormData();
+ 
+@@ -56,7 +58,13 @@ export const importDoc = async ([file, mimeType]: [
+     }),
+   );
+ 
+-  const response = await fetchAPI(`documents/`, {
++  // Replayable identity: retries of the same file into the same parent reuse
++  // it and the server returns the originally created document instead of
++  // creating a duplicate.
++  form.append('id', await getImportDocumentId(file, parentId));
++
++  const endpoint = parentId ? `documents/${parentId}/children/` : 'documents/';
++  const response = await fetchAPI(endpoint, {
+     method: 'POST',
+     body: form,
+     withoutContentType: true,
+@@ -69,14 +77,16 @@ export const importDoc = async ([file, mimeType]: [
+   return response.json() as Promise<Doc>;
+ };
+ 
+-type UseImportDocOptions = UseMutationOptions<Doc, APIError, [File, string]>;
++type ImportDocVariables = [File, string, string?];
++
++type UseImportDocOptions = UseMutationOptions<Doc, APIError, ImportDocVariables>;
+ 
+ export function useImportDoc(props?: UseImportDocOptions) {
+   const { toast } = useToast();
+   const queryClient = useQueryClient();
+   const { t } = useTranslation();
+ 
+-  return useMutation<Doc, APIError, [File, string]>({
++  return useMutation<Doc, APIError, ImportDocVariables>({
+     mutationFn: importDoc,
+     ...props,
+     onSuccess: (...successProps) => {
+@@ -100,6 +110,15 @@ export function useImportDoc(props?: UseImportDocOptions) {
+               return oldData;
+             }
+ 
++            // A retried import replays the same document: insert it only once
++            // so the list keeps its current size on duplicate responses.
++            const alreadyListed = oldData.pages.some((page) =>
++              page.results.some((doc) => doc.id === importedDoc.id),
++            );
++            if (alreadyListed) {
++              return oldData;
++            }
++
+             return {
+               ...oldData,
+               pages: oldData.pages.map((page, index) => {
+diff --git a/src/frontend/apps/impress/src/features/docs/doc-management/utils/__tests__/importId.test.ts b/src/frontend/apps/impress/src/features/docs/doc-management/utils/__tests__/importId.test.ts
+new file mode 100644
+index 00000000..7195f582
+--- /dev/null
++++ b/src/frontend/apps/impress/src/features/docs/doc-management/utils/__tests__/importId.test.ts
+@@ -0,0 +1,55 @@
++import { validate as validateUuid, version as uuidVersion } from 'uuid';
++import { describe, expect, it } from 'vitest';
++
++import { getImportDocumentId } from '../importId';
++
++const makeFile = (name: string, content: string) =>
++  new File([content], name, { type: 'text/markdown' });
++
++describe('getImportDocumentId', () => {
++  it('returns a valid v5 UUID', async () => {
++    const id = await getImportDocumentId(makeFile('a.md', 'hello'));
++
++    expect(validateUuid(id)).toBe(true);
++    expect(uuidVersion(id)).toBe(5);
++  });
++
++  it('is stable for the same file and parent across retries', async () => {
++    const file = makeFile('readme.md', '# Hello');
++
++    const first = await getImportDocumentId(file);
++    const retry = await getImportDocumentId(file);
++
++    expect(first).toBe(retry);
++  });
++
++  it('produces the same identity for an identical file picked again', async () => {
++    const first = await getImportDocumentId(makeFile('readme.md', '# Hello'));
++    const pickedAgain = await getImportDocumentId(
++      makeFile('readme.md', '# Hello'),
++    );
++
++    expect(first).toBe(pickedAgain);
++  });
++
++  it('produces a different identity for a different file', async () => {
++    const first = await getImportDocumentId(makeFile('a.md', 'content a'));
++    const other = await getImportDocumentId(makeFile('a.md', 'content b'));
++
++    expect(other).not.toBe(first);
++  });
++
++  it('scopes the identity with the target parent', async () => {
++    const file = makeFile('readme.md', '# Hello');
++
++    const rootId = await getImportDocumentId(file);
++    const childId = await getImportDocumentId(file, 'parent-uuid');
++    const otherChildId = await getImportDocumentId(file, 'other-parent-uuid');
++
++    expect(childId).not.toBe(rootId);
++    expect(otherChildId).not.toBe(childId);
++
++    // The same parent keeps a stable identity.
++    expect(await getImportDocumentId(file, 'parent-uuid')).toBe(childId);
++  });
++});
+diff --git a/src/frontend/apps/impress/src/features/docs/doc-management/utils/importId.ts b/src/frontend/apps/impress/src/features/docs/doc-management/utils/importId.ts
+new file mode 100644
+index 00000000..c624ee27
+--- /dev/null
++++ b/src/frontend/apps/impress/src/features/docs/doc-management/utils/importId.ts
+@@ -0,0 +1,53 @@
++import { v5 as uuidv5 } from 'uuid';
++
++import { Doc } from '../types';
++
++/**
++ * Fixed namespace used to derive replayable import identities. Any valid UUID
++ * works here: it only scopes the generated v5 UUIDs.
++ */
++const IMPORT_ID_NAMESPACE = '9e6f2c11-7a31-4b6d-95f2-8d2a0c6e4b91';
++
++// One File object can be submitted with different target parents in theory;
++// the parent is part of the derived identity.
++const identitiesCache = new WeakMap<File, Record<string, string>>();
++
++const hashFile = async (file: File): Promise<string> => {
++  const bytes = new Uint8Array(await file.arrayBuffer());
++  const digest = await crypto.subtle.digest('SHA-256', bytes);
++  return Array.from(new Uint8Array(digest), (byte) =>
++    byte.toString(16).padStart(2, '0'),
++  ).join('');
++};
++
++/**
++ * Derive the replayable identity of a file import.
++ *
++ * The same file imported into the same parent always yields the same UUID, so
++ * retries after a network drop/timeout (or a quick double submission) are
++ * recognized by the server as one import. A different file or a different
++ * target parent produces another identity; reusing an identity with another
++ * file or parent is rejected by the server.
++ */
++export const getImportDocumentId = async (
++  file: File,
++  parentId?: Doc['id'],
++): Promise<string> => {
++  const parentKey = parentId ?? '';
++  const cached = identitiesCache.get(file)?.[parentKey];
++  if (cached) {
++    return cached;
++  }
++
++  const fileHash = await hashFile(file);
++  const id = uuidv5(
++    `${fileHash}:${file.name}:${parentKey}`,
++    IMPORT_ID_NAMESPACE,
++  );
++
++  const identities = identitiesCache.get(file) ?? {};
++  identities[parentKey] = id;
++  identitiesCache.set(file, identities);
++
++  return id;
++};

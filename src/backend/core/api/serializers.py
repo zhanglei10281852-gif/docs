@@ -256,7 +256,13 @@ class DocumentSerializer(ListDocumentSerializer):
                     "The provided ID is not a valid UUID."
                 )
 
-            if models.Document.objects.filter(id=value).exists():
+            # File imports carry a replayable identity: when the same identity
+            # is resubmitted with the same file, the view returns the original
+            # document instead of rejecting it. The idempotency layer is
+            # responsible for rejecting identities replayed with a different
+            # file or target parent.
+            uploaded_file = self.initial_data.get("file")
+            if not uploaded_file and models.Document.objects.filter(id=value).exists():
                 raise serializers.ValidationError(
                     "A document with this ID already exists. You cannot override it."
                 )

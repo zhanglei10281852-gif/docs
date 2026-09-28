@@ -2134,3 +2134,71 @@ class Invitation(BaseModel):
             "partial_update": is_admin_or_owner,
             "retrieve": is_admin_or_owner,
         }
+
+
+class DocumentImportStatusChoices(models.TextChoices):
+    """Statuses of an idempotent document import request."""
+
+    PROCESSING = "processing", _("Processing")
+    COMPLETED = "completed", _("Completed")
+
+
+class DocumentImport(BaseModel):
+    """
+    Idempotency record for a DOCX/Markdown file import.
+
+    The primary key is the replayable identity of the import, provided by the
+    client as the target document ID. It is shared by the root document entry
+    (``POST /documents/``) and the child document entry
+    (``POST /documents/<id>/children/``).
+
+    The record is persisted (PROCESSING) before the expensive conversion runs,
+    so that retries after a conversion failure or a crash reuse it: same
+    identity with a different file or target parent is rejected, while the
+    same identity with the same file resumes the import from a determined
+    state. Once the document and, for root documents, the owner relation are
+    committed together, the record switches to COMPLETED and subsequent
+    requests return the original document.
+    """
+
+    creator = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="document_imports",
+        verbose_name=_("creator"),
+    )
+    parent = models.ForeignKey(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="child_imports",
+        verbose_name=_("parent document"),
+        blank=True,
+        null=True,
+    )
+    document = models.ForeignKey(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="import_records",
+        verbose_name=_("imported document"),
+        blank=True,
+        null=True,
+    )
+    filename = models.CharField(_("filename"), max_length=255)
+    file_hash = models.CharField(_("file hash"), max_length=64)
+    content_type = models.CharField(_("content type"), max_length=255, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=DocumentImportStatusChoices.choices,
+        default=DocumentImportStatusChoices.PROCESSING,
+    )
+
+    class Meta:
+        db_table = "impress_document_import"
+        verbose_name = _("Document import")
+        verbose_name_plural = _("Document imports")
+        indexes = [
+            models.Index(fields=["creator", "status"], name="document_import_creator"),
+        ]
+
+    def __str__(self):
+        return f"Import {self.id!s} ({self.filename})"

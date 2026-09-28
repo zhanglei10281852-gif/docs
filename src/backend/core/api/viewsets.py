@@ -54,6 +54,7 @@ from core.services import mime_types
 from core.services.ai_services.blocknote import AIService
 from core.services.ai_services.legacy import get_legacy_ai_service
 from core.services.collaboration_services import CollaborationService
+from core.services import document_import_service
 from core.services.converter_services import (
     ConversionError,
     Converter,
@@ -734,6 +735,76 @@ class DocumentViewSet(
                     {"file": ["Could not convert file content"]}
                 ) from err
 
+    def _run_idempotent_import(self, serializer, parent):
+        """
+        Run a file import through the idempotency layer when the request
+        carries a replayable identity.
+
+        Returns ``(document, replayed)`` or ``None`` when the request must go
+        through the legacy creation flow (no file, conversion disabled, or no
+        client-provided identity).
+        """
+        uploaded_file = serializer.validated_data.get("file")
+        if not uploaded_file or not settings.CONVERSION_UPLOAD_ENABLED:
+            return None
+
+        document_id, node_kwargs = document_import_service.resolve_import_identity(
+            serializer.validated_data
+        )
+        if document_id is None:
+            return None
+
+        try:
+            return document_import_service.import_document(
+                creator=self.request.user,
+                parent=parent,
+                uploaded_file=uploaded_file,
+                document_id=document_id,
+                node_kwargs=node_kwargs,
+            )
+        except ConversionError as err:
+            logger.error("could not convert file content with error: %s", err)
+            raise drf.exceptions.ValidationError(
+                {"file": ["Could not convert file content"]}
+            ) from err
+
+    def _track_idempotent_import(self, serializer, parent, document):
+        """Emit import/creation analytics for a newly created import only."""
+        posthog_capture(
+            PosthogEventName.DOC_IMPORTED,
+            self.request.user,
+            {"content_type": serializer.validated_data["file"].content_type},
+        )
+        posthog_capture(
+            PosthogEventName.DOC_CREATED,
+            self.request.user,
+            {"document_parent": str(parent.id)} if parent is not None else {},
+            document=document,
+        )
+
+    def create(self, request, *args, **kwargs):
+        """Create a root document, replaying idempotent file imports."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        idempotent_result = self._run_idempotent_import(serializer, parent=None)
+        if idempotent_result is not None:
+            document, replayed = idempotent_result
+            serializer.instance = document
+            response_status = (
+                status.HTTP_200_OK if replayed else status.HTTP_201_CREATED
+            )
+            if not replayed:
+                self._track_idempotent_import(serializer, None, document)
+        else:
+            self.perform_create(serializer)
+            response_status = status.HTTP_201_CREATED
+
+        headers = self.get_success_headers(serializer.data)
+        return drf.response.Response(
+            serializer.data, status=response_status, headers=headers
+        )
+
     def perform_create(self, serializer):
         """Set the current user as creator and owner of the newly created object."""
 
@@ -1102,28 +1173,42 @@ class DocumentViewSet(
             )
             serializer.is_valid(raise_exception=True)
 
-            self._apply_uploaded_file_conversion(serializer)
-
-            child_document = create_tree_node_with_retry(
-                lambda: document.add_child(
-                    creator=request.user,
-                    **serializer.validated_data,
-                )
+            idempotent_result = self._run_idempotent_import(
+                serializer, parent=document
             )
+            if idempotent_result is not None:
+                child_document, replayed = idempotent_result
+                response_status = (
+                    status.HTTP_200_OK if replayed else status.HTTP_201_CREATED
+                )
+                if not replayed:
+                    self._track_idempotent_import(
+                        serializer, document, child_document
+                    )
+            else:
+                self._apply_uploaded_file_conversion(serializer)
+
+                child_document = create_tree_node_with_retry(
+                    lambda: document.add_child(
+                        creator=request.user,
+                        **serializer.validated_data,
+                    )
+                )
+                response_status = status.HTTP_201_CREATED
+
+                posthog_capture(
+                    PosthogEventName.DOC_CREATED,
+                    self.request.user,
+                    {"document_parent": str(document.id)},
+                    document=child_document,
+                )
 
             # Set the created instance to the serializer
             serializer.instance = child_document
 
-            posthog_capture(
-                PosthogEventName.DOC_CREATED,
-                self.request.user,
-                {"document_parent": str(document.id)},
-                document=child_document,
-            )
-
             headers = self.get_success_headers(serializer.data)
             return drf.response.Response(
-                serializer.data, status=status.HTTP_201_CREATED, headers=headers
+                serializer.data, status=response_status, headers=headers
             )
 
         # GET: List children

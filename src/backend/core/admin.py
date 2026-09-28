@@ -256,3 +256,39 @@ class InvitationAdmin(admin.ModelAdmin):
     def save_model(self, request, obj, form, change):
         obj.issuer = request.user
         obj.save()
+
+
+@admin.register(models.DocumentImport)
+class DocumentImportAdmin(admin.ModelAdmin):
+    """Read-only admin interface to inspect idempotent file import records."""
+
+    fields = (
+        "id",
+        "creator",
+        "parent",
+        "document",
+        "filename",
+        "file_hash",
+        "content_type",
+        "status",
+        "created_at",
+        "updated_at",
+    )
+    readonly_fields = fields
+    list_display = (
+        "id",
+        "filename",
+        "creator",
+        "parent",
+        "document",
+        "status",
+        "created_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("id", "filename", "file_hash")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
