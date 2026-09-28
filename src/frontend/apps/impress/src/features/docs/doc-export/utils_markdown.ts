@@ -3,9 +3,7 @@ import JSZip from 'jszip';
 import { isSafeUrl } from '@/utils/url';
 
 import { exportResolveFileUrl } from './api';
-import { deriveMediaFilename } from './utils_html';
-
-type MediaResolver = (url: string) => Promise<Blob | string>;
+import { type MediaResolver, deriveMediaFilename } from './utils_html';
 
 interface MediaReference {
   props: Record<string, unknown>;
@@ -45,6 +43,7 @@ export const addMediaFilesToMarkdownZip = async (
   zip: JSZip,
   mediaUrl: string,
   resolveMedia: MediaResolver = exportResolveFileUrl,
+  signal?: AbortSignal,
 ): Promise<number> => {
   const references: MediaReference[] = [];
   collectMediaReferences(blocks, references);
@@ -73,7 +72,11 @@ export const addMediaFilesToMarkdownZip = async (
         return null;
       }
 
-      const blob = await resolveMedia(url.href);
+      // A cancellation aborts the fetch and propagates to the export job so
+      // that no partial archive is ever generated.
+      const blob = signal
+        ? await resolveMedia(url.href, signal)
+        : await resolveMedia(url.href);
       if (!(blob instanceof Blob)) {
         return null;
       }

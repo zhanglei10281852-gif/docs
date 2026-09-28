@@ -4,6 +4,12 @@ import { isSafeUrl } from '@/utils/url';
 
 import { exportResolveFileUrl } from './api';
 
+/** Resolves a media URL to a Blob. A failed read may degrade to the URL string. */
+export type MediaResolver = (
+  url: string,
+  signal?: AbortSignal,
+) => Promise<Blob | string>;
+
 // Escape user-provided text  before injecting it into the exported HTML document.
 export const escapeHtml = (value: string): string =>
   value
@@ -407,6 +413,8 @@ export const addMediaFilesToZip = async (
   parsedDocument: Document,
   zip: JSZip,
   mediaUrl: string,
+  resolveMedia: MediaResolver = exportResolveFileUrl,
+  signal?: AbortSignal,
 ) => {
   const mediaFiles: { filename: string; blob: Blob }[] = [];
   const mediaElements = Array.from(
@@ -441,7 +449,11 @@ export const addMediaFilesToZip = async (
         return;
       }
 
-      const fetched = await exportResolveFileUrl(url.href);
+      // A cancellation aborts the fetch and propagates to the export job so
+      // that no partial archive is ever generated.
+      const fetched = signal
+        ? await resolveMedia(url.href, signal)
+        : await resolveMedia(url.href);
 
       if (!(fetched instanceof Blob)) {
         return;

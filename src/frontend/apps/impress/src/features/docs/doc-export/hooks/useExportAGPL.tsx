@@ -22,16 +22,21 @@ import { pdfDocsSchemaMappings } from '../mappingPDF';
 export const useExportAGPL = (doc: Doc, editor?: DocsBlockNoteEditor) => {
   const { t } = useTranslation();
 
-  const docToBlob = async (format: string, documentTitle: string) => {
+  const docToBlob = async (
+    format: string,
+    documentTitle: string,
+    exportDocument: DocsBlockNoteEditor['document'],
+    signal?: AbortSignal,
+  ) => {
     if (!editor) {
       return;
     }
 
-    const exportDocument = editor.document;
     let blobExport: Blob | undefined = undefined;
     if (format === 'pdf') {
       const exporter = new PDFExporter(editor.schema, pdfDocsSchemaMappings, {
-        resolveFileUrl: async (url) => exportCorsResolveFileUrl(doc.id, url),
+        resolveFileUrl: async (url) =>
+          exportCorsResolveFileUrl(doc.id, url, signal),
         emojiSource: {
           format: 'png',
           builder(code) {
@@ -69,7 +74,8 @@ export const useExportAGPL = (doc: Doc, editor?: DocsBlockNoteEditor) => {
       blobExport = await pdf(pdfDocument).toBlob();
     } else if (format === 'docx') {
       const exporter = new DOCXExporter(editor.schema, docxDocsSchemaMappings, {
-        resolveFileUrl: async (url) => exportCorsResolveFileUrl(doc.id, url),
+        resolveFileUrl: async (url) =>
+          exportCorsResolveFileUrl(doc.id, url, signal),
       });
 
       blobExport = await exporter.toBlob(exportDocument, {
@@ -78,7 +84,8 @@ export const useExportAGPL = (doc: Doc, editor?: DocsBlockNoteEditor) => {
       });
     } else if (format === 'odt') {
       const exporter = new ODTExporter(editor.schema, odtDocsSchemaMappings, {
-        resolveFileUrl: async (url) => exportCorsResolveFileUrl(doc.id, url),
+        resolveFileUrl: async (url) =>
+          exportCorsResolveFileUrl(doc.id, url, signal),
       });
 
       blobExport = await exporter.toODTDocument(exportDocument);

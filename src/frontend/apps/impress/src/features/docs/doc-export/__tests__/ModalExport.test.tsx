@@ -152,4 +152,143 @@ describe('ModalExport', () => {
     );
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  test('captures the document title and content once, at job start', async () => {
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ModalExport doc={{ title: 'Roadmap' } as Doc} onClose={onClose} />,
+      { wrapper: AppWrapper },
+    );
+
+    await user.click(screen.getByTestId('doc-export-download-button'));
+
+    await waitFor(() =>
+      expect(mocks.docToBlob).toHaveBeenCalledWith(
+        'pdf',
+        'Roadmap',
+        [],
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
+  test('cancelling during media packaging aborts the job without download or toast', async () => {
+    let rejectMediaExport: (reason: unknown) => void = () => undefined;
+    let capturedSignal: AbortSignal | undefined;
+    mocks.addMediaFilesToMarkdownZip.mockImplementation(
+      (_blocks, _zip, _mediaUrl, _resolveMedia, signal) =>
+        new Promise<number>((_resolve, reject) => {
+          capturedSignal = signal as AbortSignal;
+          rejectMediaExport = reject;
+        }),
+    );
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ModalExport doc={{ title: 'Roadmap' } as Doc} onClose={onClose} />,
+      { wrapper: AppWrapper },
+    );
+
+    await user.click(screen.getByRole('combobox', { name: 'Format' }));
+    await user.click(screen.getByRole('option', { name: /Markdown/ }));
+    await user.click(screen.getByTestId('doc-export-download-button'));
+
+    await waitFor(() => expect(capturedSignal).toBeInstanceOf(AbortSignal));
+
+    await user.click(
+      screen.getByRole('button', { name: 'Cancel the download' }),
+    );
+
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(onClose).toHaveBeenCalledOnce();
+
+    const abortError = new Error('Aborted');
+    abortError.name = 'AbortError';
+    await act(async () => {
+      rejectMediaExport(abortError);
+    });
+
+    expect(mocks.downloadFile).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
+    expect(mocks.blocksToMarkdownLossy).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  test('discards a PDF conversion result that completes after cancellation', async () => {
+    let resolveDocToBlob: (value: Blob | undefined) => void = () => undefined;
+    let capturedSignal: AbortSignal | undefined;
+    mocks.docToBlob.mockImplementation(
+      (_format, _title, _blocks, signal) =>
+        new Promise<Blob | undefined>((resolve) => {
+          capturedSignal = signal as AbortSignal;
+          resolveDocToBlob = resolve;
+        }),
+    );
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ModalExport doc={{ title: 'Roadmap' } as Doc} onClose={onClose} />,
+      { wrapper: AppWrapper },
+    );
+
+    // PDF is the default format when the AGPL exporters are available.
+    await user.click(screen.getByTestId('doc-export-download-button'));
+
+    await waitFor(() => expect(capturedSignal).toBeInstanceOf(AbortSignal));
+
+    await user.click(
+      screen.getByRole('button', { name: 'Cancel the download' }),
+    );
+
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveDocToBlob(new Blob(['pdf'], { type: 'application/pdf' }));
+    });
+
+    expect(mocks.downloadFile).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  test('unmounting the modal aborts the export and discards a late result', async () => {
+    let resolveMediaExport: (value: number) => void = () => undefined;
+    let capturedSignal: AbortSignal | undefined;
+    mocks.addMediaFilesToMarkdownZip.mockImplementation(
+      (_blocks, _zip, _mediaUrl, _resolveMedia, signal) =>
+        new Promise<number>((resolve) => {
+          capturedSignal = signal as AbortSignal;
+          resolveMediaExport = resolve;
+        }),
+    );
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+
+    const { unmount } = render(
+      <ModalExport doc={{ title: 'Roadmap' } as Doc} onClose={onClose} />,
+      { wrapper: AppWrapper },
+    );
+
+    await user.click(screen.getByRole('combobox', { name: 'Format' }));
+    await user.click(screen.getByRole('option', { name: /Markdown/ }));
+    await user.click(screen.getByTestId('doc-export-download-button'));
+
+    await waitFor(() => expect(capturedSignal).toBeInstanceOf(AbortSignal));
+
+    unmount();
+
+    expect(capturedSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      resolveMediaExport(0);
+    });
+
+    expect(mocks.downloadFile).not.toHaveBeenCalled();
+    expect(mocks.toast).not.toHaveBeenCalled();
+    expect(mocks.blocksToMarkdownLossy).not.toHaveBeenCalled();
+  });
 });

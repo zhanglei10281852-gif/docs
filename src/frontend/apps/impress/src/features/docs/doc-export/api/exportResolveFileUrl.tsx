@@ -2,9 +2,12 @@ import { baseApiUrl } from '@/api';
 import { Doc } from '@/features/docs/doc-management';
 import { isDataUrl, isLocalDevOrigin, isSameOrigin } from '@/utils/url';
 
+import { isAbortError } from '../exportJob';
+
 export const exportCorsResolveFileUrl = async (
   docId: Doc['id'],
   url: string,
+  signal?: AbortSignal,
 ) => {
   let resolvedUrl = url;
 
@@ -16,21 +19,32 @@ export const exportCorsResolveFileUrl = async (
     resolvedUrl = `${baseApiUrl()}documents/${docId}/cors-proxy/?url=${encodeURIComponent(url)}`;
   }
 
-  return exportResolveFileUrl(resolvedUrl);
+  return exportResolveFileUrl(resolvedUrl, signal);
 };
 
-export const exportResolveFileUrl = async (url: string) => {
+export const exportResolveFileUrl = async (
+  url: string,
+  signal?: AbortSignal,
+) => {
   try {
     const response = await fetch(url, {
       credentials: 'include',
+      signal,
     });
 
     if (!response.ok) {
       throw new Error(`Unexpected response status: ${response.status}`);
     }
 
-    return response.blob();
+    return await response.blob();
   } catch (error) {
+    // A user-triggered cancellation is not a regular media read failure:
+    // rethrow it so the export job stops and never ships a partial archive,
+    // instead of falling back to the original URL.
+    if (isAbortError(error) || signal?.aborted) {
+      throw error;
+    }
+
     console.error(`Failed to fetch image: ${url}`, error);
   }
 

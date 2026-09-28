@@ -122,4 +122,29 @@ describe('exportResolveFileUrl', () => {
 
     expect(result).toBe('/media/image.png');
   });
+
+  test('passes the abort signal to the request', async () => {
+    const controller = new AbortController();
+
+    await exportResolveFileUrl('/media/image.png', controller.signal);
+
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      credentials: 'include',
+      signal: controller.signal,
+    });
+  });
+
+  test('rethrows the abort error when the export is cancelled', async () => {
+    const controller = new AbortController();
+    const abortError = new Error('Aborted');
+    abortError.name = 'AbortError';
+    fetchMock.mockRejectedValueOnce(abortError);
+
+    const promise = exportResolveFileUrl('/media/image.png', controller.signal);
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    // Cancellation must not be logged as a failed media read.
+    expect(console.error).not.toHaveBeenCalled();
+  });
 });
